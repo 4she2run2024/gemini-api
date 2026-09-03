@@ -136,7 +136,7 @@ GatewayResult
 
 ### 6.2 统一协议模型
 
-新增 `GatewayProtocol.swift`，至少定义以下职责明确的类型：
+新增 `gateway-protocol.swift`，至少定义以下职责明确的类型：
 
 - `GatewayRole`：system、developer、user、assistant、tool。
 - `GatewayContent`：文本、工具调用、工具结果；媒体类型在解析阶段转为
@@ -153,7 +153,7 @@ GatewayResult
 
 ### 6.3 统一生成管线
 
-新增 `GatewayPipeline.swift`：
+新增 `gateway-pipeline.swift`：
 
 1. 把 `GatewayRequest` 转成结构化单条 prompt。
 2. 复用现有本地工具提示词格式和 `ToolCallPolicy`。
@@ -273,13 +273,20 @@ API Key、原始鉴权 header 或完整上游 payload。
 
 新增：
 
-- `Sources/GatewayProtocol.swift`
-- `Sources/GatewayPipeline.swift`
-- `Sources/HTTPServer+Responses.swift`
-- `Sources/HTTPServer+Gemini.swift`
-- `Tests/GatewayProtocolTests.swift`
-- `Tests/ResponsesProtocolTests.swift`
-- `Tests/GeminiProtocolTests.swift`
+- `Sources/gateway-protocol.swift`
+- `Sources/gateway-pipeline.swift`
+- `Sources/http-server-responses.swift`
+- `Sources/http-server-gemini.swift`
+- `Tests/gateway-protocol-tests.swift`
+- `Tests/gateway-pipeline-tests.swift`
+- `Tests/responses-protocol-tests.swift`
+- `Tests/gemini-protocol-tests.swift`
+- `Tests/config-migration-tests.swift`
+- `Tests/real-upstream-smoke.swift`
+- `Tests/sdk-smoke-server.swift`
+- `Tests/sdk-smoke.py`
+- `Tests/gemini-sdk-smoke.mjs`
+- `Tests/run-tests.sh`
 
 修改：
 

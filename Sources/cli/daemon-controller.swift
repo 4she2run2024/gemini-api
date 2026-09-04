@@ -18,6 +18,7 @@ private let ALLOWED_CHILD_ENVIRONMENT_VALUES: [String: Set<String>] = [
         "early_exit",
         "readiness_timeout",
         "late_readiness",
+        "post_ready_failure",
     ],
 ]
 
@@ -319,8 +320,10 @@ final class DaemonController {
         let daemon_lock: DaemonLock
         do {
             daemon_lock = try state_store.acquire_lock()
-        } catch {
+        } catch DaemonLockAcquisitionError.contention {
             return .conflict
+        } catch {
+            return .runtime
         }
 
         do {
@@ -569,7 +572,8 @@ final class DaemonChildRunner {
         let daemon_lock: DaemonLock
         do {
             daemon_lock = try DaemonLock.adopt_after_spawn(
-                descriptor: invocation.lock_descriptor)
+                descriptor: invocation.lock_descriptor,
+                canonical_lock_path: state_store.lock_path)
         } catch {
             _ = write_readiness(
                 .runtime_failure,
@@ -601,6 +605,9 @@ final class DaemonChildRunner {
                 model: invocation.model))
             child_runtime.install_termination_handlers()
             try child_runtime.start(readiness_timeout: DAEMON_READINESS_TIMEOUT_SECONDS)
+            guard child_runtime.termination_reason == nil else {
+                throw DaemonChildError.listener_terminated
+            }
             child_logger.start_rotation_monitor()
             startup_stage = "listening"
 
@@ -617,6 +624,9 @@ final class DaemonChildRunner {
                 version: GEMINI2API_VERSION)
             try state_store.publish(state)
             published_state = state
+            guard child_runtime.termination_reason == nil else {
+                throw DaemonChildError.listener_terminated
+            }
             child_logger.write(
                 .info,
                 event: "daemon_ready",
@@ -672,12 +682,14 @@ final class DaemonChildRunner {
                 : CLIExitCode.runtime.rawValue)
         }
 
-        runtime?.wait_until_termination()
+        let termination_reason = runtime?.wait_until_termination()
         runtime?.stop()
         logger?.stop()
         recycle_state_if_owned(published_state)
         daemon_lock.unlock()
-        _exit(CLIExitCode.success.rawValue)
+        _exit(termination_reason == .listener_failed
+            ? CLIExitCode.runtime.rawValue
+            : CLIExitCode.success.rawValue)
     }
 
     // 功能：退出前重新核验完整状态与当前身份，
@@ -696,6 +708,7 @@ final class DaemonChildRunner {
 
 private enum DaemonChildError: Error {
     case identity_unavailable
+    case listener_terminated
 }
 
 // 功能：仅把已确认 EADDRINUSE 的 listener 错误映射为端口冲突。

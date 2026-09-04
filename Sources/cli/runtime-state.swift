@@ -48,9 +48,12 @@ enum IdentityResult: Equatable {
 private enum RuntimeStateError: Error {
     case invalid_path
     case invalid_state
-    case lock_unavailable
     case process_inspection_uncertain
     case system_call_failed
+}
+
+enum DaemonLockAcquisitionError: Error {
+    case contention
 }
 
 final class DaemonLock {
@@ -107,16 +110,32 @@ final class DaemonLock {
         descriptor = -1
     }
 
-    // 功能：在 exec child 中接管 parent 映射的锁 descriptor。
-    // 参数：descriptor 必须不低于 3、有效且指向 regular file。
+    // 功能：在 exec child 中核验并接管 parent 映射的 canonical 锁 descriptor。
+    // 参数：descriptor 必须有效；canonical_lock_path 为本次 runtime 固定锁路径。
     // 返回值：负责最终 unlock 和 close 的锁句柄。
-    static func adopt_after_spawn(descriptor: Int32) throws -> DaemonLock {
+    static func adopt_after_spawn(
+        descriptor: Int32,
+        canonical_lock_path: URL
+    ) throws -> DaemonLock {
         guard descriptor >= 3, fcntl(descriptor, F_GETFD) >= 0 else {
             throw RuntimeStateError.system_call_failed
         }
-        var info = stat()
-        guard fstat(descriptor, &info) == 0,
-              info.st_mode & S_IFMT == S_IFREG else {
+        var descriptor_info = stat()
+        var path_info = stat()
+        var path_buffer = [CChar](repeating: 0, count: PROCESS_PATH_BUFFER_SIZE)
+        guard fstat(descriptor, &descriptor_info) == 0,
+              descriptor_info.st_mode & S_IFMT == S_IFREG,
+              lstat(canonical_lock_path.path, &path_info) == 0,
+              path_info.st_mode & S_IFMT == S_IFREG,
+              descriptor_info.st_dev == path_info.st_dev,
+              descriptor_info.st_ino == path_info.st_ino,
+              fcntl(descriptor, F_GETPATH, &path_buffer) == 0 else {
+            throw RuntimeStateError.system_call_failed
+        }
+        let descriptor_path = URL(fileURLWithPath: String(cString: path_buffer))
+        guard descriptor_path.standardizedFileURL
+                == canonical_lock_path.standardizedFileURL,
+              system_flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
             throw RuntimeStateError.system_call_failed
         }
         return DaemonLock(descriptor: descriptor)
@@ -250,6 +269,13 @@ final class RuntimeStateStore {
         self.trash_item = trash_item
     }
 
+    // 功能：向 production child 暴露本次固定 canonical lock 路径。
+    // 参数：无。
+    // 返回值：由 RuntimePaths 派生的 daemon.lock URL。
+    var lock_path: URL {
+        paths.lock_path
+    }
+
     // 功能：安全创建并非阻塞取得固定保留的 daemon 排他锁。
     // 参数：无。
     // 返回值：持锁句柄；已有 contender 时抛错。
@@ -261,8 +287,12 @@ final class RuntimeStateStore {
             mode: MANAGED_FILE_MODE,
             enforce_mode: true)
         guard system_flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+            let lock_errno = errno
             _ = Darwin.close(descriptor)
-            throw RuntimeStateError.lock_unavailable
+            if lock_errno == EWOULDBLOCK || lock_errno == EAGAIN {
+                throw DaemonLockAcquisitionError.contention
+            }
+            throw RuntimeStateError.system_call_failed
         }
         return DaemonLock(descriptor: descriptor)
     }
@@ -430,7 +460,8 @@ private func ensure_base_directory(_ url: URL) throws {
 // 返回值：无；symlink 或非目录目标会抛错。
 private func ensure_managed_directory(_ url: URL) throws {
     if !path_exists_without_following(url) {
-        guard Darwin.mkdir(url.path, MANAGED_DIRECTORY_MODE) == 0 else {
+        guard Darwin.mkdir(url.path, MANAGED_DIRECTORY_MODE) == 0
+                || errno == EEXIST else {
             throw RuntimeStateError.system_call_failed
         }
     }

@@ -4,6 +4,10 @@
 import Foundation
 
 let GEMINI2API_VERSION = "0.2.0"
+private let CLI_RESERVED_OPTIONS: Set<String> = [
+    "--host", "--port", "--model", "--daemon", "--timeout", "--json",
+    "--help", "-h", "--version",
+]
 
 enum CLIExitCode: Int32 {
     case success = 0
@@ -44,6 +48,18 @@ private enum CLIUsageError: Error, CustomStringConvertible {
 // 返回值：不会正常返回；始终抛出 CLIUsageError。
 private func throw_usage_error() throws -> Never {
     throw CLIUsageError.invalid_arguments
+}
+
+// 功能：读取 valued option 的下一 token，并拒绝把保留 option 当作值。
+// 参数：arguments 为完整参数；index 为当前 option 位置。
+// 返回值：合法的下一 token；缺失或保留 token 时抛出 usage 错误。
+private func cli_option_value(_ arguments: [String], index: Int) throws -> String {
+    guard index + 1 < arguments.count else { try throw_usage_error() }
+    let value = arguments[index + 1]
+    guard !value.isEmpty, !CLI_RESERVED_OPTIONS.contains(value) else {
+        try throw_usage_error()
+    }
+    return value
 }
 
 // 功能：依据现有 MODELS 和 think 范围校验模型选项。
@@ -102,25 +118,21 @@ func parse_cli_command(_ arguments: [String]) throws -> CLICommand {
             let option = arguments[index]
             switch option {
             case "--host":
-                guard host == nil, index + 1 < arguments.count else {
-                    try throw_usage_error()
-                }
-                host = arguments[index + 1]
-                guard !host!.isEmpty else { try throw_usage_error() }
+                guard host == nil else { try throw_usage_error() }
+                host = try cli_option_value(arguments, index: index)
                 index += 2
             case "--port":
-                guard port == nil, index + 1 < arguments.count,
-                      let parsed_port = Int(arguments[index + 1]),
+                guard port == nil else { try throw_usage_error() }
+                let port_value = try cli_option_value(arguments, index: index)
+                guard let parsed_port = Int(port_value),
                       (1...65535).contains(parsed_port) else {
                     try throw_usage_error()
                 }
                 port = parsed_port
                 index += 2
             case "--model":
-                guard model == nil, index + 1 < arguments.count else {
-                    try throw_usage_error()
-                }
-                let parsed_model = arguments[index + 1]
+                guard model == nil else { try throw_usage_error() }
+                let parsed_model = try cli_option_value(arguments, index: index)
                 guard valid_model(parsed_model) else { try throw_usage_error() }
                 model = parsed_model
                 index += 2
@@ -146,7 +158,8 @@ func parse_cli_command(_ arguments: [String]) throws -> CLICommand {
         }
         if arguments.count == 1 { return .stop(timeout: 10) }
         guard arguments[1] == "--timeout" else { try throw_usage_error() }
-        guard let timeout = TimeInterval(arguments[2]), timeout > 0,
+        let timeout_value = try cli_option_value(arguments, index: 1)
+        guard let timeout = TimeInterval(timeout_value), timeout > 0,
               timeout.isFinite else {
             try throw_usage_error()
         }

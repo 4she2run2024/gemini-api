@@ -50,9 +50,36 @@ struct CLICommandTests {
         precondition(try_parse(["-h"]) == .help)
         precondition(try_parse(["--version"]) == .version)
         precondition(try_parse(["serve", "--port", "65535"]) != nil)
+        precondition(try_parse(["serve", "--port", "1"]) != nil)
+        let missing_value_cases = [
+            ["serve", "--host"],
+            ["serve", "--port"],
+            ["serve", "--model"],
+            ["stop", "--timeout"],
+        ]
+        for arguments in missing_value_cases {
+            expect_usage_error(arguments)
+        }
+        let reserved_value_cases = [
+            ["serve", "--host", "--daemon"],
+            ["serve", "--port", "--daemon"],
+            ["serve", "--model", "--daemon"],
+            ["stop", "--timeout", "--help"],
+        ]
+        for arguments in reserved_value_cases {
+            expect_usage_error(arguments)
+        }
+        let duplicate_value_cases = [
+            ["serve", "--host", "127.0.0.1", "--host", "127.0.0.2"],
+            ["serve", "--port", "8080", "--port", "8081"],
+            ["serve", "--model", "gemini-3.6-flash", "--model",
+             "gemini-3.8-flash"],
+        ]
+        for arguments in duplicate_value_cases {
+            expect_usage_error(arguments)
+        }
         expect_usage_error(["serve", "--port", "0"])
         expect_usage_error(["serve", "--port", "65536"])
-        expect_usage_error(["serve", "--port"])
         expect_usage_error(["serve", "--daemon", "--daemon"])
         expect_usage_error(["status", "--daemon"])
         expect_usage_error(["--gemini2api-internal-daemon-child"])

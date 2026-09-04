@@ -15,20 +15,25 @@ final class CLIApplication {
     private let store: Store
     private let generator_factory: () -> TextGenerating
     private let controller_factory: (Store, TextGenerating) throws -> DaemonController
+    private let runtime_factory: (Store, TextGenerating) -> GatewayRuntime
 
     // 功能：创建延迟解析 generator 的 CLI 应用。
     // 参数：store 为配置；generator_factory 在 Store.load 后解析 generator；
-    // controller_factory 构造 daemon 编排器。
+    // controller_factory 构造 daemon 编排器；runtime_factory 构造前台 runtime。
     // 返回值：初始化后的 CLIApplication。
     init(
         store: Store,
         generator_factory: @escaping () -> TextGenerating,
         controller_factory: @escaping (Store, TextGenerating) throws
-            -> DaemonController
+            -> DaemonController,
+        runtime_factory: @escaping (Store, TextGenerating) -> GatewayRuntime = {
+            GatewayRuntime(store: $0, generator: $1)
+        }
     ) {
         self.store = store
         self.generator_factory = generator_factory
         self.controller_factory = controller_factory
+        self.runtime_factory = runtime_factory
     }
 
     // 功能：为已有测试和非 production 调用保留具体 generator 便捷入口。
@@ -82,7 +87,7 @@ final class CLIApplication {
         _ options: ServeOptions,
         generator: TextGenerating
     ) -> CLIExitCode {
-        let runtime = GatewayRuntime(store: store, generator: generator)
+        let runtime = runtime_factory(store, generator)
         let endpoint: RuntimeEndpoint
         do {
             endpoint = try runtime.configure(RuntimeOverrides(
@@ -129,8 +134,12 @@ final class CLIApplication {
         write_cli_output(
             "Gemini2API 正在监听 http://\(endpoint.host):\(endpoint.port) "
                 + "(PID \(getpid()))")
-        runtime.wait_until_termination()
+        let termination_reason = runtime.wait_until_termination()
         runtime.stop()
+        guard termination_reason == .stopped else {
+            write_cli_error("listener 运行失败")
+            return .runtime
+        }
         return .success
     }
 
@@ -141,6 +150,20 @@ final class CLIApplication {
         json: Bool,
         generator: TextGenerating
     ) -> CLIExitCode {
+        do {
+            _ = try runtime_factory(store, generator).configure(RuntimeOverrides(
+                host: nil,
+                port: nil,
+                model: nil))
+        } catch GatewayRuntimeError.invalid_host,
+                GatewayRuntimeError.invalid_port,
+                GatewayRuntimeError.invalid_model {
+            write_cli_error("配置错误")
+            return .usage
+        } catch {
+            write_cli_error("状态配置检查失败")
+            return .runtime
+        }
         do {
             let controller = try controller_factory(store, generator)
             let (report, exit_code) = controller.status()

@@ -376,8 +376,8 @@ macOS 废纸篓，不永久删除。
 
 同一端口只能由一个 listener 使用。App、前台 CLI、托管 daemon 或第三方程序
 占用目标端口时，新实例只报告冲突，不查杀端口 owner。无托管状态时，
-`status` 会探测配置中的端口，并把健康的 Gemini2API App 或前台 CLI 报告为
-`unmanaged`。
+`status` 会探测配置中的端口；收到健康的 Gemini2API 响应时报告 `unmanaged`，
+但 owner 未知，不会推断该响应属于 App 或前台 CLI。
 
 `stop` 只会在状态文件、PID、实际可执行路径、进程启动时间和版本均
 匹配时，向受托管 daemon 发送一次 `SIGTERM`。它不会停止 App、前台 CLI 或

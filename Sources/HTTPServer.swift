@@ -28,7 +28,6 @@ final class HTTPServer {
     func start() throws {
         stop()
         let params = NWParameters.tcp
-        params.allowLocalEndpointReuse = true
         let port = NWEndpoint.Port(rawValue: UInt16(cfg.port))!
         let l: NWListener
         if cfg.host == "0.0.0.0" || cfg.host.isEmpty {

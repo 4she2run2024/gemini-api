@@ -21,6 +21,7 @@ private enum ControllerChildMode: String {
     case early_exit
     case readiness_timeout
     case late_readiness
+    case post_ready_failure
 }
 
 private final class ControllerFakeGenerator: TextGenerating {
@@ -293,6 +294,7 @@ struct DaemonControllerTests {
         try test_stop_sends_one_sigterm_and_accepts_exit(test_root: test_root)
         try test_stop_accepts_pid_reuse(test_root: test_root)
         try test_stop_times_out_without_sigkill(test_root: test_root)
+        try test_lock_acquisition_error_classification(test_root: test_root)
         try test_concurrent_daemon_start_publishes_ready_state(test_root: test_root)
         try test_multithreaded_parent_daemon_lifecycle(test_root: test_root)
         try test_unrelated_descriptor_is_closed_on_exec(test_root: test_root)
@@ -302,6 +304,7 @@ struct DaemonControllerTests {
         try test_child_preserves_replaced_state(test_root: test_root)
         try test_port_owner_survives_daemon_conflict(test_root: test_root)
         try test_child_early_exit_returns_runtime(test_root: test_root)
+        try test_post_ready_failure_exits_runtime(test_root: test_root)
         try test_readiness_timeout_cleans_child(test_root: test_root)
         try test_late_readiness_cleans_up_after_parent_timeout(test_root: test_root)
         print("DaemonControllerTests passed")
@@ -938,6 +941,39 @@ struct DaemonControllerTests {
         precondition(!records.contains(where: { $0.signal_number == SIGKILL }))
     }
 
+    // 功能：验证 lock contention 为 conflict，而路径错误为 runtime。
+    // 参数：test_root 为隔离测试总目录。
+    // 返回值：无；两类 acquire failure 被合并时终止测试。
+    private static func test_lock_acquisition_error_classification(
+        test_root: URL
+    ) throws {
+        let contention_root = test_root.appendingPathComponent("lock-contention")
+        let contention_fixture = make_daemon_fixture(
+            root: contention_root,
+            port: try available_loopback_port())
+        let held_lock = try contention_fixture.state_store.acquire_lock()
+        defer { held_lock.unlock() }
+        let options = ServeOptions(
+            host: nil,
+            port: nil,
+            model: nil,
+            daemon: true)
+        precondition(contention_fixture.controller.serve_daemon(options: options)
+            == .conflict)
+
+        let path_error_root = test_root.appendingPathComponent("lock-path-error")
+        let paths = make_runtime_paths(root: path_error_root)
+        try FileManager.default.createDirectory(
+            at: paths.application_directory.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try Data("not a directory".utf8).write(to: paths.application_directory)
+        let path_error_fixture = make_daemon_fixture(
+            root: path_error_root,
+            port: try available_loopback_port())
+        precondition(path_error_fixture.controller.serve_daemon(options: options)
+            == .runtime)
+    }
+
     // 功能：验证并发 daemon 启动只有一个 ready，
     // 且 ready 前已发布可探测状态。
     // 参数：test_root 为隔离测试总目录。
@@ -957,8 +993,9 @@ struct DaemonControllerTests {
         try Data("go".utf8).write(to: gate_path)
         let helper_results = try helpers.map(wait_for_serve_helper)
         let raw_values = helper_results.map(\.exit_code).sorted()
-        precondition(raw_values == [CLIExitCode.success.rawValue,
-                                    CLIExitCode.conflict.rawValue])
+        precondition(
+            raw_values == [CLIExitCode.success.rawValue, CLIExitCode.conflict.rawValue],
+            "并发启动退出码：\(raw_values)")
         precondition(helper_results.allSatisfy { $0.signal_count == 0 })
         guard let state = try first.state_store.load() else {
             preconditionFailure("ready 返回前必须发布 daemon 状态")
@@ -1096,6 +1133,31 @@ struct DaemonControllerTests {
             daemon: true)) == .runtime)
         let state = try fixture.state_store.load()
         precondition(state == nil)
+    }
+
+    // 功能：验证 child 已报告 ready 后 listener failure
+    // 仍以 runtime 退出并清状态。
+    // 参数：test_root 为隔离测试总目录。
+    // 返回值：无；failure 被误报 success 或状态残留时终止测试。
+    private static func test_post_ready_failure_exits_runtime(test_root: URL) throws {
+        let root = test_root.appendingPathComponent("daemon-post-ready-failure")
+        let fixture = make_daemon_fixture(
+            root: root,
+            port: try available_loopback_port(),
+            child_mode: .post_ready_failure)
+        precondition(fixture.controller.serve_daemon(options: ServeOptions(
+            host: nil,
+            port: nil,
+            model: nil,
+            daemon: true)) == .success)
+        guard let state = try fixture.state_store.load() else {
+            preconditionFailure("ready 返回时必须已发布状态")
+        }
+        let status = try wait_for_child_status(pid: state.pid, timeout: 3)
+        precondition((status & 0x7F) == 0)
+        precondition((status >> 8) == CLIExitCode.runtime.rawValue)
+        let remaining_state = try fixture.state_store.load()
+        precondition(remaining_state == nil)
     }
 
     // 功能：验证忽略 SIGTERM 的 child 不会让 readiness 超时路径无限 waitpid。
@@ -1696,7 +1758,7 @@ struct DaemonControllerTests {
             case .readiness_timeout:
                 _ = Darwin.signal(SIGTERM, SIG_IGN)
                 Thread.sleep(forTimeInterval: 12)
-            case .normal, .late_readiness:
+            case .normal, .late_readiness, .post_ready_failure:
                 break
             }
             return DaemonLogger(
@@ -1708,7 +1770,17 @@ struct DaemonControllerTests {
             store: store,
             generator: ControllerFakeGenerator(),
             runtime_factory: { child_store, generator in
-                GatewayRuntime(store: child_store, generator: generator)
+                let server = HTTPServer(generator: generator, config: child_store)
+                let runtime = GatewayRuntime(
+                    store: child_store,
+                    generator: generator,
+                    server: server)
+                if child_mode == .post_ready_failure {
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 1) {
+                        server.state_did_fail?(POSIXError(.ECONNABORTED))
+                    }
+                }
+                return runtime
             },
             state_store: state_store,
             logger_factory: logger_factory,

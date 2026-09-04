@@ -70,6 +70,8 @@ struct RuntimeStateTests {
         try test_atomic_publish_and_recycling(test_root: test_root)
         try test_exclusive_lock_is_retained(test_root: test_root)
         try test_parent_relinquish_preserves_duplicated_lock(test_root: test_root)
+        try test_adopt_rejects_unrelated_regular_file(test_root: test_root)
+        try test_adopt_rejects_independent_contended_lock(test_root: test_root)
         try test_symlink_and_non_directory_targets_are_rejected(test_root: test_root)
         try test_identity_classification(test_root: test_root)
         try test_darwin_current_process_identity(test_root: test_root)
@@ -209,7 +211,8 @@ struct RuntimeStateTests {
             minimum_descriptor: 64)
         precondition(duplicated_descriptor >= 64)
         let adopted_lock = try DaemonLock.adopt_after_spawn(
-            descriptor: duplicated_descriptor)
+            descriptor: duplicated_descriptor,
+            canonical_lock_path: fixture.paths.lock_path)
 
         inherited_lock.relinquish_after_spawn_in_parent()
         try expect_throw { _ = try fixture.store.acquire_lock() }
@@ -217,6 +220,66 @@ struct RuntimeStateTests {
         adopted_lock.unlock()
         let replacement_lock = try fixture.store.acquire_lock()
         replacement_lock.unlock()
+    }
+
+    // 功能：验证 production 接管边界拒绝任意普通文件 descriptor。
+    // 参数：test_root 为隔离测试总目录。
+    // 返回值：无；任意文件被当作 daemon lock 接管时终止测试。
+    private static func test_adopt_rejects_unrelated_regular_file(
+        test_root: URL
+    ) throws {
+        let fixture = try make_fixture(test_root: test_root, name: "unrelated-adopt")
+        let canonical_lock = try fixture.store.acquire_lock()
+        canonical_lock.unlock()
+        let unrelated_path = test_root.appendingPathComponent("unrelated-file")
+        try Data().write(to: unrelated_path)
+        var descriptor = Darwin.open(unrelated_path.path, O_RDWR | O_NOFOLLOW)
+        guard descriptor >= 0 else { throw RuntimeStateTestError.expected_failure }
+        defer {
+            if descriptor >= 0 { _ = Darwin.close(descriptor) }
+        }
+        do {
+            let adopted_lock = try DaemonLock.adopt_after_spawn(
+                descriptor: descriptor,
+                canonical_lock_path: fixture.paths.lock_path)
+            descriptor = -1
+            adopted_lock.unlock()
+            throw RuntimeStateTestError.expected_failure
+        } catch RuntimeStateTestError.expected_failure {
+            throw RuntimeStateTestError.expected_failure
+        } catch {
+            return
+        }
+    }
+
+    // 功能：验证 canonical lock 被其他 open description 持有时拒绝接管。
+    // 参数：test_root 为隔离测试总目录。
+    // 返回值：无；未持有 flock 的独立 descriptor 被接管时终止测试。
+    private static func test_adopt_rejects_independent_contended_lock(
+        test_root: URL
+    ) throws {
+        let fixture = try make_fixture(test_root: test_root, name: "held-adopt")
+        let owning_lock = try fixture.store.acquire_lock()
+        defer { owning_lock.unlock() }
+        var descriptor = Darwin.open(
+            fixture.paths.lock_path.path,
+            O_RDWR | O_NOFOLLOW)
+        guard descriptor >= 0 else { throw RuntimeStateTestError.expected_failure }
+        defer {
+            if descriptor >= 0 { _ = Darwin.close(descriptor) }
+        }
+        do {
+            let adopted_lock = try DaemonLock.adopt_after_spawn(
+                descriptor: descriptor,
+                canonical_lock_path: fixture.paths.lock_path)
+            descriptor = -1
+            adopted_lock.unlock()
+            throw RuntimeStateTestError.expected_failure
+        } catch RuntimeStateTestError.expected_failure {
+            throw RuntimeStateTestError.expected_failure
+        } catch {
+            return
+        }
     }
 
     // 功能：验证受管目录、状态文件的 symlink 及非目录目标均被拒绝。

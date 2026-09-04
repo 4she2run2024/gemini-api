@@ -62,6 +62,8 @@ struct GatewayRuntimeTests {
         try test_configure_start_and_stop_preserve_config(test_root: test_root)
         try test_invalid_overrides_are_rejected(test_root: test_root)
         try test_occupied_port_reports_listener_failure(test_root: test_root)
+        try test_overlapping_listener_bind_is_exclusive(test_root: test_root)
+        try test_post_ready_listener_failure_is_retained(test_root: test_root)
         try test_signal_stops_listener(signal_number: SIGINT, test_root: test_root)
         try test_signal_stops_listener(signal_number: SIGTERM, test_root: test_root)
         print("GatewayRuntimeTests passed")
@@ -156,6 +158,74 @@ struct GatewayRuntimeTests {
         }
     }
 
+    // 功能：验证 wildcard、loopback 及同 host 的重叠 listener 均严格互斥。
+    // 参数：test_root 为隔离测试总目录。
+    // 返回值：无；第二个 listener ready 时终止测试。
+    private static func test_overlapping_listener_bind_is_exclusive(
+        test_root: URL
+    ) throws {
+        let host_pairs = [
+            ("0.0.0.0", "127.0.0.1"),
+            ("127.0.0.1", "0.0.0.0"),
+            ("127.0.0.1", "127.0.0.1"),
+        ]
+        for (index, pair) in host_pairs.enumerated() {
+            let port = try available_loopback_port()
+            let first_store = try make_loaded_store(
+                config_root: test_root.appendingPathComponent("overlap-first-\(index)"))
+            let second_store = try make_loaded_store(
+                config_root: test_root.appendingPathComponent("overlap-second-\(index)"))
+            let first_runtime = GatewayRuntime(
+                store: first_store,
+                generator: RuntimeFakeGenerator())
+            let second_runtime = GatewayRuntime(
+                store: second_store,
+                generator: RuntimeFakeGenerator())
+            _ = try first_runtime.configure(RuntimeOverrides(
+                host: pair.0,
+                port: port,
+                model: nil))
+            _ = try second_runtime.configure(RuntimeOverrides(
+                host: pair.1,
+                port: port,
+                model: nil))
+            try first_runtime.start(readiness_timeout: 3)
+            defer { first_runtime.stop() }
+
+            do {
+                try second_runtime.start(readiness_timeout: 3)
+                second_runtime.stop()
+                preconditionFailure("重叠 listener 不得同时 ready")
+            } catch GatewayRuntimeError.listener_failed {
+                second_runtime.stop()
+            }
+        }
+    }
+
+    // 功能：注入 ready 后 listener failure，并验证终止原因不会被 stop 覆盖。
+    // 参数：test_root 为隔离测试总目录。
+    // 返回值：无；failure 被误报为正常停止时终止测试。
+    private static func test_post_ready_listener_failure_is_retained(
+        test_root: URL
+    ) throws {
+        let store = try make_loaded_store(
+            config_root: test_root.appendingPathComponent("post-ready-failure"))
+        let server = HTTPServer(generator: RuntimeFakeGenerator(), config: store)
+        let runtime = GatewayRuntime(
+            store: store,
+            generator: RuntimeFakeGenerator(),
+            server: server)
+        _ = try runtime.configure(RuntimeOverrides(
+            host: "127.0.0.1",
+            port: try available_loopback_port(),
+            model: nil))
+        try runtime.start(readiness_timeout: 3)
+        server.state_did_fail?(POSIXError(.ECONNABORTED))
+        precondition(runtime.wait_until_termination() == .listener_failed)
+        runtime.stop()
+        precondition(runtime.termination_reason == .listener_failed)
+    }
+
     // 功能：在 helper 子进程中发送指定信号，
     // 验证等待被唤醒且 listener 已停止。
     // 参数：signal_number 为 SIGINT 或 SIGTERM；test_root 为隔离测试总目录。
@@ -216,7 +286,7 @@ struct GatewayRuntimeTests {
         runtime.install_termination_handlers()
         try runtime.start(readiness_timeout: 3)
         write_stdout("READY \(port)\n")
-        runtime.wait_until_termination()
+        precondition(runtime.wait_until_termination() == .stopped)
         try wait_until_listener_stops(port: port)
         write_stdout("STOPPED\n")
     }

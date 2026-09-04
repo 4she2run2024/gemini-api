@@ -25,6 +25,11 @@ enum GatewayRuntimeError: Error {
     case listener_failed(Error)
 }
 
+enum GatewayRuntimeTerminationReason: Equatable {
+    case stopped
+    case listener_failed
+}
+
 private final class RuntimeStartResult {
     private let lock = NSLock()
     private let semaphore = DispatchSemaphore(value: 0)
@@ -62,15 +67,19 @@ final class GatewayRuntime {
     private let server: HTTPServer
     private let termination_lock = NSLock()
     private let termination_semaphore = DispatchSemaphore(value: 0)
-    private var termination_completed = false
+    private var stored_termination_reason: GatewayRuntimeTerminationReason?
     private var signal_sources: [DispatchSourceSignal] = []
 
     // 功能：使用注入配置和生成器创建独立 HTTPServer。
-    // 参数：store 为本次配置；generator 为文本生成器。
+    // 参数：store 为本次配置；generator 为文本生成器；server 可供测试注入。
     // 返回值：初始化后的共享 runtime。
-    init(store: Store, generator: TextGenerating) {
+    init(
+        store: Store,
+        generator: TextGenerating,
+        server: HTTPServer? = nil
+    ) {
         self.store = store
-        server = HTTPServer(generator: generator, config: store)
+        self.server = server ?? HTTPServer(generator: generator, config: store)
     }
 
     // 功能：验证并原子应用本次内存覆盖，不写回配置文件。
@@ -106,26 +115,26 @@ final class GatewayRuntime {
         }
         server.state_did_fail = { [weak self] error in
             start_result.complete(.failure(error))
-            self?.complete_termination()
+            self?.complete_termination(.listener_failed)
         }
 
         do {
             try server.start()
         } catch {
-            complete_termination()
+            complete_termination(.listener_failed)
             throw GatewayRuntimeError.listener_failed(error)
         }
         guard readiness_timeout > 0,
               let result = start_result.wait(timeout: readiness_timeout) else {
             server.stop()
-            complete_termination()
+            complete_termination(.listener_failed)
             throw GatewayRuntimeError.readiness_timeout
         }
         do {
             try result.get()
         } catch {
             server.stop()
-            complete_termination()
+            complete_termination(.listener_failed)
             throw GatewayRuntimeError.listener_failed(error)
         }
     }
@@ -151,9 +160,19 @@ final class GatewayRuntime {
 
     // 功能：阻塞当前调用者，直到 stop、signal 或 listener failure。
     // 参数：无。
-    // 返回值：终止事件完成后返回。
-    func wait_until_termination() {
+    // 返回值：首个正常停止或 listener failure 原因。
+    func wait_until_termination() -> GatewayRuntimeTerminationReason {
         termination_semaphore.wait()
+        return termination_reason!
+    }
+
+    // 功能：读取已保存的首个终止原因。
+    // 参数：无。
+    // 返回值：尚未终止时为 nil，否则为不可覆盖的首个原因。
+    var termination_reason: GatewayRuntimeTerminationReason? {
+        termination_lock.lock()
+        defer { termination_lock.unlock() }
+        return stored_termination_reason
     }
 
     // 功能：停止 listener 并只发布一次终止事件。
@@ -161,19 +180,19 @@ final class GatewayRuntime {
     // 返回值：无。
     func stop() {
         server.stop()
-        complete_termination()
+        complete_termination(.stopped)
     }
 
     // 功能：锁保护地发布一次终止事件。
-    // 参数：无。
+    // 参数：reason 为正常停止或 listener failure。
     // 返回值：无；重复调用被忽略。
-    private func complete_termination() {
+    private func complete_termination(_ reason: GatewayRuntimeTerminationReason) {
         termination_lock.lock()
-        guard !termination_completed else {
+        guard stored_termination_reason == nil else {
             termination_lock.unlock()
             return
         }
-        termination_completed = true
+        stored_termination_reason = reason
         termination_lock.unlock()
         termination_semaphore.signal()
     }

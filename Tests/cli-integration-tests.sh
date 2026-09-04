@@ -230,10 +230,13 @@ cat >"$helper_source" <<'SWIFT'
 // 使用方法：由 cli-integration-tests.sh 与 production CLI 源码共同编译。
 
 import Darwin
+import Dispatch
 import Foundation
 
 private let TEST_ROOT_ENVIRONMENT = "GEMINI2API_TEST_ROOT"
 private let TEST_DAEMON_MODE_ENVIRONMENT = "GEMINI2API_TEST_DAEMON_MODE"
+private let TEST_FOREGROUND_FAILURE_ENVIRONMENT =
+    "GEMINI2API_TEST_FOREGROUND_FAILURE"
 private let GENERATOR_RESOLUTION_MARKER = "generator-resolution.txt"
 
 private final class CLIFakeGenerator: TextGenerating {
@@ -315,6 +318,20 @@ private func make_test_application(
                 paths: paths,
                 child_environment: child_environment,
                 trash_item: recycle_test_item)
+        },
+        runtime_factory: { loaded_store, generator in
+            let server = HTTPServer(generator: generator, config: loaded_store)
+            let runtime = GatewayRuntime(
+                store: loaded_store,
+                generator: generator,
+                server: server)
+            if ProcessInfo.processInfo.environment[
+                TEST_FOREGROUND_FAILURE_ENVIRONMENT] == "1" {
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.25) {
+                    server.state_did_fail?(POSIXError(.ECONNABORTED))
+                }
+            }
+            return runtime
         })
 }
 
@@ -573,6 +590,60 @@ cat >"$config_directory/config.json" <<'JSON'
 JSON
 chmod 600 "$config_directory/config.json"
 
+for invalid_config_case in host port model; do
+  python3 - "$config_directory/config.json" "$invalid_config_case" <<'PYTHON'
+import json
+import sys
+
+config = {
+    "host": "127.0.0.1",
+    "port": 18081,
+    "default_model": "gemini-3.6-flash",
+    "log_requests": False,
+    "api_keys": ["integration-key"],
+}
+case = sys.argv[2]
+if case == "host":
+    config["host"] = "invalid host"
+elif case == "port":
+    config["port"] = 0
+else:
+    config["default_model"] = "unknown-model"
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(config, handle)
+PYTHON
+  chmod 600 "$config_directory/config.json"
+  set +e
+  run_cli status >"$test_root/status-invalid-$invalid_config_case.out" \
+    2>"$test_root/status-invalid-$invalid_config_case.err"
+  invalid_status_code=$?
+  set -e
+  if [[ "$invalid_status_code" != "2" ]]; then
+    echo "invalid status $invalid_config_case exit=$invalid_status_code, want=2" >&2
+    exit 1
+  fi
+  [[ ! -s "$test_root/status-invalid-$invalid_config_case.out" ]]
+  [[ "$(<"$test_root/status-invalid-$invalid_config_case.err")" == *"配置错误"* ]]
+done
+if [[ -e "$generator_marker" ]]; then
+  mv "$generator_marker" "$test_root/status-generator-resolution.txt"
+fi
+
+python3 - "$config_directory/config.json" <<'PYTHON'
+import json
+import sys
+
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump({
+        "host": "127.0.0.1",
+        "port": 18081,
+        "default_model": "gemini-3.6-flash",
+        "log_requests": False,
+        "api_keys": ["integration-key"],
+    }, handle)
+PYTHON
+chmod 600 "$config_directory/config.json"
+
 if [[ -n ${GEMINI2API_TEST_STATE_CLEANUP_MODE:-} ]]; then
   state_cleanup_mode="$GEMINI2API_TEST_STATE_CLEANUP_MODE"
   state_cleanup_pid="${GEMINI2API_TEST_STATE_CLEANUP_PID:?}"
@@ -711,6 +782,18 @@ for signal_name in INT TERM; do
   wait "$foreground_pid"
   [[ ! -e "$test_root/support/Gemini2API/runtime/daemon.json" ]]
 done
+
+foreground_failure_port="$(random_port)"
+set +e
+GEMINI2API_TEST_ROOT="$test_root" \
+GEMINI2API_TEST_FOREGROUND_FAILURE=1 \
+  "$cli_binary" serve --host 127.0.0.1 --port "$foreground_failure_port" \
+  >"$test_root/foreground-failure.out" \
+  2>"$test_root/foreground-failure.err"
+foreground_failure_code=$?
+set -e
+[[ "$foreground_failure_code" == "5" ]]
+[[ ! -e "$test_root/support/Gemini2API/runtime/daemon.json" ]]
 
 daemon_port="$(random_port)"
 run_cli serve --host 127.0.0.1 --port "$daemon_port" --daemon

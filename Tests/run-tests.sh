@@ -146,3 +146,4 @@ run_test daemon-controller-tests \
   -framework CryptoKit
 
 bash Tests/release-script-tests.sh
+bash Tests/cli-integration-tests.sh --auto

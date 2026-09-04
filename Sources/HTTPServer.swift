@@ -133,6 +133,8 @@ final class HTTPServer {
             sendJSON(conn, ["status": "ok", "models": MODELS.map { $0.id }])
         case ("POST", "/v1/chat/completions"):
             handleOpenAIChat(conn, body: body)
+        case ("POST", "/v1/responses"):
+            handle_responses(conn, body: body)
         case ("POST", "/v1/messages"):
             handleAnthropicMessages(conn, body: body)
         case ("POST", "/v1/messages/count_tokens"):

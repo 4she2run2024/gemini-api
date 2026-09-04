@@ -70,6 +70,8 @@ struct RuntimeStateTests {
         try test_atomic_publish_and_recycling(test_root: test_root)
         try test_exclusive_lock_is_retained(test_root: test_root)
         try test_parent_relinquish_preserves_duplicated_lock(test_root: test_root)
+        try test_adopt_accepts_case_equivalent_canonical_path(
+            test_root: test_root)
         try test_adopt_rejects_unrelated_regular_file(test_root: test_root)
         try test_adopt_rejects_independent_contended_lock(test_root: test_root)
         try test_symlink_and_non_directory_targets_are_rejected(test_root: test_root)
@@ -217,6 +219,56 @@ struct RuntimeStateTests {
         inherited_lock.relinquish_after_spawn_in_parent()
         try expect_throw { _ = try fixture.store.acquire_lock() }
 
+        adopted_lock.unlock()
+        let replacement_lock = try fixture.store.acquire_lock()
+        replacement_lock.unlock()
+    }
+
+    // 功能：验证 case-insensitive volume 上不同大小写表示的
+    // canonical lock 可接管。
+    // 参数：test_root 为隔离测试总目录。
+    // 返回值：无；同 inode 的合法 inherited flock
+    // 被路径字符串差异拒绝时抛错。
+    private static func test_adopt_accepts_case_equivalent_canonical_path(
+        test_root: URL
+    ) throws {
+        let fixture_name = "Case-Equivalent-Adopt"
+        let fixture = try make_fixture(test_root: test_root, name: fixture_name)
+        let inherited_lock = try fixture.store.acquire_lock()
+        var duplicated_descriptor = try inherited_lock.duplicate_for_spawn(
+            minimum_descriptor: 64)
+        let alternate_root = test_root.appendingPathComponent(
+            fixture_name.lowercased())
+        let alternate_paths = RuntimePaths(
+            application_support_directory: alternate_root.appendingPathComponent(
+                "Application Support"),
+            logs_directory: alternate_root.appendingPathComponent("Logs"))
+        var canonical_info = stat()
+        var alternate_info = stat()
+        guard lstat(fixture.paths.lock_path.path, &canonical_info) == 0,
+              lstat(alternate_paths.lock_path.path, &alternate_info) == 0 else {
+            _ = Darwin.close(duplicated_descriptor)
+            inherited_lock.unlock()
+            return
+        }
+        precondition(canonical_info.st_dev == alternate_info.st_dev)
+        precondition(canonical_info.st_ino == alternate_info.st_ino)
+        precondition(fixture.paths.lock_path.standardizedFileURL
+            != alternate_paths.lock_path.standardizedFileURL)
+
+        let adopted_lock: DaemonLock
+        do {
+            adopted_lock = try DaemonLock.adopt_after_spawn(
+                descriptor: duplicated_descriptor,
+                canonical_lock_path: alternate_paths.lock_path)
+            duplicated_descriptor = -1
+        } catch {
+            _ = Darwin.close(duplicated_descriptor)
+            inherited_lock.unlock()
+            throw error
+        }
+        inherited_lock.relinquish_after_spawn_in_parent()
+        try expect_throw { _ = try fixture.store.acquire_lock() }
         adopted_lock.unlock()
         let replacement_lock = try fixture.store.acquire_lock()
         replacement_lock.unlock()

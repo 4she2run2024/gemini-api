@@ -133,8 +133,10 @@ final class DaemonLock {
             throw RuntimeStateError.system_call_failed
         }
         let descriptor_path = URL(fileURLWithPath: String(cString: path_buffer))
-        guard descriptor_path.standardizedFileURL
-                == canonical_lock_path.standardizedFileURL,
+        guard let resolved_descriptor_path = resolved_existing_path(descriptor_path),
+              let resolved_canonical_path = resolved_existing_path(
+                  canonical_lock_path),
+              resolved_descriptor_path == resolved_canonical_path,
               system_flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
             throw RuntimeStateError.system_call_failed
         }
@@ -144,6 +146,16 @@ final class DaemonLock {
     deinit {
         unlock()
     }
+}
+
+// 功能：用 realpath 取得现存路径在当前文件系统上的
+// 真实大小写与 symlink 解析结果。
+// 参数：url 已经过调用方的类型及 inode 核验。
+// 返回值：系统可解析时为绝对路径，否则为 nil。
+private func resolved_existing_path(_ url: URL) -> String? {
+    guard let resolved_pointer = realpath(url.path, nil) else { return nil }
+    defer { free(resolved_pointer) }
+    return String(cString: resolved_pointer)
 }
 
 struct RuntimePaths {

@@ -145,5 +145,6 @@ run_test daemon-controller-tests \
   -framework Network \
   -framework CryptoKit
 
+bash -n Tests/build-artifact-tests.sh
 bash Tests/release-script-tests.sh
 bash Tests/cli-integration-tests.sh --auto

@@ -1,12 +1,15 @@
 #!/bin/bash
+# 用途：构建 Gemini2API 通用 App 与不链接 AppKit 的通用 CLI。
+# 使用方法：在项目根目录执行 ./build.sh。
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP="Gemini2API"
-BUNDLE="$APP.app"
-BINDIR="$BUNDLE/Contents/MacOS"
-ZIP="$APP-macOS.zip"
-VERSION="0.1.0"
+app_name="Gemini2API"
+bundle="$app_name.app"
+binary_dir="$bundle/Contents/MacOS"
+zip_path="$app_name-macOS.zip"
+cli_binary="gemini2api-macOS"
+version="0.2.0"
 
 # 功能：把已有产物或临时目录移入当前用户的 macOS 废纸篓。
 # 参数：首参数为待回收路径。
@@ -21,52 +24,101 @@ move_to_trash() {
   mv "$target" "$trash_dir/${target_name}.$(date +%Y%m%d-%H%M%S).$$"
 }
 
-move_to_trash "$BUNDLE"
-move_to_trash "$ZIP"
-mkdir -p "$BINDIR"
+move_to_trash "$bundle"
+move_to_trash "$zip_path"
+move_to_trash "$cli_binary"
+mkdir -p "$binary_dir"
 
-BUILD_OUTPUT_DIR="$(mktemp -d)"
-trap 'move_to_trash "$BUILD_OUTPUT_DIR"' EXIT
+build_output_dir="$(mktemp -d)"
+trap 'move_to_trash "$build_output_dir"' EXIT
 
 echo "编译中…（arm64 + x86_64 通用二进制）"
-FRAMEWORKS=(
+shared_sources=(
+  Sources/AnthropicProtocol.swift
+  Sources/Config.swift
+  Sources/Engine.swift
+  Sources/HTTPServer.swift
+  Sources/HTTPServer+Anthropic.swift
+  Sources/HTTPServer+OpenAI.swift
+  Sources/Models.swift
+  Sources/Prompt.swift
+  Sources/ToolCalling.swift
+  Sources/Util.swift
+  Sources/gateway-pipeline.swift
+  Sources/gateway-protocol.swift
+  Sources/gateway-runtime.swift
+  Sources/http-server-gemini.swift
+  Sources/http-server-responses.swift
+)
+app_sources=(
+  "${shared_sources[@]}"
+  Sources/AppDelegate.swift
+  Sources/SettingsWindow.swift
+  Sources/main.swift
+)
+cli_sources=(
+  "${shared_sources[@]}"
+  Sources/cli/cli-command.swift
+  Sources/cli/cli-main.swift
+  Sources/cli/daemon-controller.swift
+  Sources/cli/daemon-logger.swift
+  Sources/cli/runtime-state.swift
+)
+app_frameworks=(
   -framework AppKit
   -framework Network
   -framework CryptoKit
   -framework ServiceManagement
 )
-swiftc -O -o "$BUILD_OUTPUT_DIR/$APP.arm64" Sources/*.swift \
-  -target arm64-apple-macos13 "${FRAMEWORKS[@]}"
-swiftc -O -o "$BUILD_OUTPUT_DIR/$APP.x86_64" Sources/*.swift \
-  -target x86_64-apple-macos13 "${FRAMEWORKS[@]}"
+cli_frameworks=(
+  -framework Network
+  -framework CryptoKit
+)
+
+swiftc -O -o "$build_output_dir/$app_name.arm64" "${app_sources[@]}" \
+  -target arm64-apple-macos13 "${app_frameworks[@]}"
+swiftc -O -o "$build_output_dir/$app_name.x86_64" "${app_sources[@]}" \
+  -target x86_64-apple-macos13 "${app_frameworks[@]}"
 lipo -create \
-  "$BUILD_OUTPUT_DIR/$APP.arm64" \
-  "$BUILD_OUTPUT_DIR/$APP.x86_64" \
-  -output "$BINDIR/$APP"
+  "$build_output_dir/$app_name.arm64" \
+  "$build_output_dir/$app_name.x86_64" \
+  -output "$binary_dir/$app_name"
+
+swiftc -O -o "$build_output_dir/$cli_binary.arm64" "${cli_sources[@]}" \
+  -target arm64-apple-macos13 "${cli_frameworks[@]}"
+swiftc -O -o "$build_output_dir/$cli_binary.x86_64" "${cli_sources[@]}" \
+  -target x86_64-apple-macos13 "${cli_frameworks[@]}"
+lipo -create \
+  "$build_output_dir/$cli_binary.arm64" \
+  "$build_output_dir/$cli_binary.x86_64" \
+  -output "$cli_binary"
 
 # 从 logo.png 生成 app 图标（macOS 自带 sips/iconutil）
-mkdir -p "$BUNDLE/Contents/Resources"
-ICONSET="$BUILD_OUTPUT_DIR/AppIcon.iconset"
-mkdir -p "$ICONSET"
-for s in 16 32 128 256 512; do
-  sips -z $s $s          logo.png --out "$ICONSET/icon_${s}x${s}.png"    >/dev/null
-  sips -z $((s*2)) $((s*2)) logo.png --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
+mkdir -p "$bundle/Contents/Resources"
+iconset="$build_output_dir/AppIcon.iconset"
+mkdir -p "$iconset"
+for icon_size in 16 32 128 256 512; do
+  double_size=$((icon_size * 2))
+  sips -z "$icon_size" "$icon_size" logo.png \
+    --out "$iconset/icon_${icon_size}x${icon_size}.png" >/dev/null
+  sips -z "$double_size" "$double_size" logo.png \
+    --out "$iconset/icon_${icon_size}x${icon_size}@2x.png" >/dev/null
 done
-iconutil -c icns "$ICONSET" -o "$BUNDLE/Contents/Resources/AppIcon.icns"
+iconutil -c icns "$iconset" -o "$bundle/Contents/Resources/AppIcon.icns"
 
-cat > "$BUNDLE/Contents/Info.plist" <<PLIST
+cat > "$bundle/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC
   "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>$APP</string>
-  <key>CFBundleDisplayName</key><string>$APP</string>
+  <key>CFBundleName</key><string>$app_name</string>
+  <key>CFBundleDisplayName</key><string>$app_name</string>
   <key>CFBundleIdentifier</key><string>com.gemini2api.gateway</string>
-  <key>CFBundleVersion</key><string>$VERSION</string>
-  <key>CFBundleShortVersionString</key><string>$VERSION</string>
-  <key>CFBundleExecutable</key><string>$APP</string>
+  <key>CFBundleVersion</key><string>$version</string>
+  <key>CFBundleShortVersionString</key><string>$version</string>
+  <key>CFBundleExecutable</key><string>$app_name</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
@@ -75,12 +127,14 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-codesign --force --deep --sign - "$BUNDLE" 2>/dev/null || true
+codesign --force --deep --sign - "$bundle" 2>/dev/null || true
 
 # 重新注册，强制 Finder 刷新图标缓存。
 # macOS 按 bundle id 缓存，否则显示旧图标。
-LSREG="/System/Library/Frameworks/CoreServices.framework/Versions/A/"
-LSREG+="Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
-[ -x "$LSREG" ] && "$LSREG" -f "$PWD/$BUNDLE" 2>/dev/null || true
+lsregister_path="/System/Library/Frameworks/CoreServices.framework/Versions/A/"
+lsregister_path+="Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
+[ -x "$lsregister_path" ] \
+  && "$lsregister_path" -f "$PWD/$bundle" 2>/dev/null || true
 
-echo "完成：$(pwd)/$BUNDLE"
+echo "完成：$(pwd)/$bundle"
+echo "完成：$(pwd)/$cli_binary"

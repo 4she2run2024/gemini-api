@@ -7,7 +7,13 @@ final class HTTPServer {
     static let shared = HTTPServer(generator: Engine.shared, config: Store.shared)
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "gemini.http", attributes: .concurrent)
-    private(set) var running = false
+    private let running_lock = NSLock()
+    private var running_value = false
+    var running: Bool {
+        running_lock.lock()
+        defer { running_lock.unlock() }
+        return running_value
+    }
     var stateDidChange: ((Bool) -> Void)?
     let generator: TextGenerating
     let cfg: Store
@@ -26,7 +32,9 @@ final class HTTPServer {
         if cfg.host == "0.0.0.0" || cfg.host.isEmpty {
             l = try NWListener(using: params, on: port)  // 所有网卡（局域网可访问）
         } else {
-            params.requiredLocalEndpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(cfg.host), port: port)
+            params.requiredLocalEndpoint = NWEndpoint.hostPort(
+                host: NWEndpoint.Host(cfg.host),
+                port: port)
             l = try NWListener(using: params)
         }
         l.newConnectionHandler = { [weak self] conn in self?.accept(conn) }
@@ -49,7 +57,9 @@ final class HTTPServer {
     }
 
     private func updateRunning(_ value: Bool) {
-        running = value
+        running_lock.lock()
+        running_value = value
+        running_lock.unlock()
         stateDidChange?(value)
     }
 
@@ -70,14 +80,19 @@ final class HTTPServer {
     }
 
     private func readMore(_ conn: NWConnection, _ st: ConnState) {
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 16) { [weak self] data, _, isComplete, err in
+        conn.receive(
+            minimumIncompleteLength: 1,
+            maximumLength: 1 << 16
+        ) { [weak self] data, _, isComplete, err in
             guard let self = self else { return }
             if let d = data, !d.isEmpty { st.buffer.append(d) }
 
             if !st.headersDone, let r = st.buffer.range(of: Data("\r\n\r\n".utf8)) {
                 st.headersDone = true
                 st.headerEnd = r.upperBound
-                st.headerText = String(decoding: st.buffer[st.buffer.startIndex..<r.lowerBound], as: UTF8.self)
+                st.headerText = String(
+                    decoding: st.buffer[st.buffer.startIndex..<r.lowerBound],
+                    as: UTF8.self)
                 st.contentLength = self.contentLength(st.headerText)
             }
 
@@ -113,11 +128,20 @@ final class HTTPServer {
         var headers: [String: String] = [:]
         for line in lines.dropFirst() {
             let kv = line.split(separator: ":", maxSplits: 1)
-            if kv.count == 2 { headers[kv[0].lowercased()] = kv[1].trimmingCharacters(in: .whitespaces) }
+            if kv.count == 2 {
+                headers[kv[0].lowercased()] = kv[1]
+                    .trimmingCharacters(in: .whitespaces)
+            }
         }
 
         if method == "OPTIONS" {
-            sendRaw(conn, "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", close: true)
+            var response = "HTTP/1.1 204 No Content\r\n"
+            response += "Access-Control-Allow-Origin: *\r\n"
+            response += "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            response += "Access-Control-Allow-Headers: *\r\n"
+            response += "Content-Length: 0\r\n"
+            response += "Connection: close\r\n\r\n"
+            sendRaw(conn, response, close: true)
             return
         }
 
@@ -131,7 +155,15 @@ final class HTTPServer {
 
         switch (method, pathOnly(path)) {
         case ("GET", "/v1/models"):
-            let data = MODELS.map { ["id": $0.id, "object": "model", "created": 1700000000, "owned_by": "google", "description": $0.desc] as [String: Any] }
+            let data = MODELS.map {
+                [
+                    "id": $0.id,
+                    "object": "model",
+                    "created": 1700000000,
+                    "owned_by": "google",
+                    "description": $0.desc,
+                ] as [String: Any]
+            }
             sendJSON(conn, ["object": "list", "data": data])
         case ("GET", "/"):
             sendJSON(conn, ["status": "ok", "models": MODELS.map { $0.id }])
@@ -144,8 +176,18 @@ final class HTTPServer {
         case ("POST", "/v1/messages/count_tokens"):
             handleAnthropicTokenCount(conn, body: body)
         default:
-            if method == "POST", let gemini_route = try? parse_gemini_route(path) {
-                handle_gemini(conn, body: body, route: gemini_route)
+            if method == "POST", is_gemini_action_target(path) {
+                do {
+                    let gemini_route = try parse_gemini_route(path)
+                    handle_gemini(conn, body: body, route: gemini_route)
+                } catch let error as GatewayProtocolError {
+                    sendJSON(conn, gemini_error(error), status: error.http_status)
+                } catch {
+                    sendJSON(
+                        conn,
+                        gemini_error(status: 400, message: "invalid Gemini path"),
+                        status: 400)
+                }
                 return
             }
             sendJSON(conn, not_found_error(path: path), status: 404)
@@ -154,6 +196,22 @@ final class HTTPServer {
 
     private func pathOnly(_ path: String) -> String {
         path.split(separator: "?", maxSplits: 1).first.map(String.init) ?? path
+    }
+
+    // 功能：识别模型参数可能非法、但 action 形态完整的 Gemini 路径。
+    // 参数：path 为包含可选 query 的原始 request target。
+    // 返回值：仅在模型仍是单个原始 segment 且 action 已知时为 true。
+    private func is_gemini_action_target(_ path: String) -> Bool {
+        let endpoint = pathOnly(path)
+        let prefix = "/v1beta/models/"
+        guard endpoint.hasPrefix(prefix) else { return false }
+        let remainder = String(endpoint.dropFirst(prefix.count))
+        let actions = [":generateContent", ":streamGenerateContent"]
+        for action in actions where remainder.hasSuffix(action) {
+            let model = remainder.dropLast(action.count)
+            return !model.contains("/")
+        }
+        return false
     }
 
     private func authorized(_ headers: [String: String], path: String) -> Bool {
@@ -237,20 +295,50 @@ final class HTTPServer {
     }
 
     private func sendRaw(_ conn: NWConnection, _ s: String, close: Bool) {
-        conn.send(content: Data(s.utf8), completion: .contentProcessed { _ in if close { conn.cancel() } })
+        conn.send(
+            content: Data(s.utf8),
+            completion: .contentProcessed { _ in
+                if close { conn.cancel() }
+            })
     }
 
     func startSSE(_ conn: NWConnection) {
-        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+        var head = "HTTP/1.1 200 OK\r\n"
+        head += "Content-Type: text/event-stream\r\n"
+        head += "Cache-Control: no-cache\r\n"
+        head += "Access-Control-Allow-Origin: *\r\n"
+        head += "Connection: close\r\n\r\n"
         conn.send(content: Data(head.utf8), completion: .contentProcessed { _ in })
     }
 
-    // ponytail: on 标记无锁读写，Bool 竞争无害，仅用于尽早停止上游
-    final class ClientGone { var on = false }
+    // 功能：在线程间同步客户端断开状态。
+    // 使用方法：Network callback 调用 mark，生成线程调用 is_set。
+    final class ClientGone {
+        private let lock = NSLock()
+        private var value = false
+
+        // 功能：把连接标记为已断开。
+        // 参数：无。
+        // 返回值：无。
+        func mark() {
+            lock.lock()
+            value = true
+            lock.unlock()
+        }
+
+        // 功能：读取连接是否已断开。
+        // 参数：无。
+        // 返回值：已断开时为 true。
+        func is_set() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
 
     func sseSend(_ conn: NWConnection, _ s: String, gone: ClientGone? = nil) {
         conn.send(content: Data(s.utf8), completion: .contentProcessed { err in
-            if err != nil { gone?.on = true }
+            if err != nil { gone?.mark() }
         })
     }
 

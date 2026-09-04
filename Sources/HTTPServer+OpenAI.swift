@@ -51,14 +51,14 @@ extension HTTPServer {
     ) {
         let gone = ClientGone()
         conn.stateUpdateHandler = { state in
-            if case .failed = state { gone.on = true }
-            if case .cancelled = state { gone.on = true }
+            if case .failed = state { gone.mark() }
+            if case .cancelled = state { gone.mark() }
         }
         startSSE(conn)
         do {
             try pipeline.stream_text(
                 context.execution,
-                is_cancelled: { gone.on }
+                is_cancelled: { gone.is_set() }
             ) { delta in
                 let chunk = self.openAIChunk(
                     context,

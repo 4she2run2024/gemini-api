@@ -245,12 +245,12 @@ extension HTTPServer {
     ) {
         let gone = ClientGone()
         conn.stateUpdateHandler = { state in
-            if case .failed = state { gone.on = true }
-            if case .cancelled = state { gone.on = true }
+            if case .failed = state { gone.mark() }
+            if case .cancelled = state { gone.mark() }
         }
         conn.receive(minimumIncompleteLength: 1, maximumLength: 1) {
             _, _, is_complete, error in
-            if is_complete || error != nil { gone.on = true }
+            if is_complete || error != nil { gone.mark() }
         }
 
         var pending_delta: String?
@@ -259,9 +259,9 @@ extension HTTPServer {
         do {
             try pipeline.stream_text(
                 context,
-                is_cancelled: { gone.on }
+                is_cancelled: { gone.is_set() }
             ) { delta in
-                guard !gone.on else { return }
+                guard !gone.is_set() else { return }
                 if let previous_delta = pending_delta {
                     let response = gemini_stream_text_response(
                         text: previous_delta,
@@ -275,7 +275,7 @@ extension HTTPServer {
                 pending_delta = delta
                 full_text += delta
             }
-            guard !gone.on else { return }
+            guard !gone.is_set() else { return }
             let usage = GatewayUsage(
                 input_tokens: approximateTokenCount(context.generation.prompt),
                 output_tokens: approximateTokenCount(full_text))
@@ -287,7 +287,7 @@ extension HTTPServer {
                 usage: usage)
             sseFinish(conn, gemini_sse_chunk(response))
         } catch let error as GatewayProtocolError {
-            guard !gone.on else { return }
+            guard !gone.is_set() else { return }
             finish_gemini_stream_error(
                 conn,
                 pending_delta: pending_delta,
@@ -296,7 +296,7 @@ extension HTTPServer {
                 error: gemini_error(error),
                 gone: gone)
         } catch {
-            guard !gone.on else { return }
+            guard !gone.is_set() else { return }
             finish_gemini_stream_error(
                 conn,
                 pending_delta: pending_delta,
@@ -326,7 +326,7 @@ extension HTTPServer {
                 response_id: response_id)
             sseSend(conn, gemini_sse_chunk(response), gone: gone)
         }
-        guard !gone.on else { return }
+        guard !gone.is_set() else { return }
         sseFinish(conn, gemini_sse_chunk(error))
     }
 }

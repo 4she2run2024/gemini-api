@@ -2,6 +2,7 @@
 // 使用方法：由 bash Tests/run-tests.sh --auto 编译并执行。
 
 import Foundation
+import Network
 
 private final class FakeGenerator: TextGenerating {
     private var output = """
@@ -166,6 +167,123 @@ private struct HTTPResult {
     var text: String { String(decoding: data, as: UTF8.self) }
 }
 
+private final class RawHTTPProbe {
+    private let lock = NSLock()
+    private var response_data = Data()
+    private var failure: Error?
+    private var did_finish = false
+    private let completed = DispatchSemaphore(value: 0)
+
+    // 功能：发送不经 URL 标准化的原始 HTTP request target。
+    // 参数：port 为服务端口；request_target 为原始路径；body 为 JSON 数据。
+    // 返回值：HTTP status 和响应体。
+    func post(
+        port: Int,
+        request_target: String,
+        body: Data
+    ) throws -> HTTPResult {
+        let connection = NWConnection(
+            host: "127.0.0.1",
+            port: NWEndpoint.Port(rawValue: UInt16(port))!,
+            using: .tcp)
+        connection.stateUpdateHandler = { [weak self] state in
+            guard let self = self else { return }
+            switch state {
+            case .ready:
+                let head = "POST \(request_target) HTTP/1.1\r\n"
+                    + "Host: 127.0.0.1\r\n"
+                    + "Content-Type: application/json\r\n"
+                    + "Content-Length: \(body.count)\r\n"
+                    + "Connection: close\r\n\r\n"
+                var request_data = Data(head.utf8)
+                request_data.append(body)
+                connection.send(
+                    content: request_data,
+                    completion: .contentProcessed { error in
+                        if let error = error {
+                            self.finish(error: error)
+                        } else {
+                            self.receive(connection)
+                        }
+                    })
+            case .failed(let error):
+                self.finish(error: error)
+            case .cancelled:
+                self.finish(error: nil)
+            default:
+                break
+            }
+        }
+        connection.start(queue: DispatchQueue(label: "gemini.raw-http-test"))
+        guard completed.wait(timeout: .now() + 5) == .success else {
+            connection.cancel()
+            throw NSError(
+                domain: "HTTPServerIntegrationTests",
+                code: 10,
+                userInfo: [NSLocalizedDescriptionKey: "raw request timed out"])
+        }
+        connection.cancel()
+
+        lock.lock()
+        defer { lock.unlock() }
+        if let failure = failure { throw failure }
+        let marker = Data("\r\n\r\n".utf8)
+        guard let header_range = response_data.range(of: marker) else {
+            throw NSError(
+                domain: "HTTPServerIntegrationTests",
+                code: 11,
+                userInfo: [NSLocalizedDescriptionKey: "invalid raw response"])
+        }
+        let header = String(
+            decoding: response_data[..<header_range.lowerBound],
+            as: UTF8.self)
+        let status = header.split(separator: " ").dropFirst().first
+            .flatMap { Int($0) } ?? 0
+        return HTTPResult(
+            status: status,
+            data: Data(response_data[header_range.upperBound...]))
+    }
+
+    // 功能：递归接收完整响应，直到服务端关闭连接。
+    // 参数：connection 为已连接的 TCP 连接。
+    // 返回值：无。
+    private func receive(_ connection: NWConnection) {
+        connection.receive(
+            minimumIncompleteLength: 1,
+            maximumLength: 1 << 16
+        ) { [weak self] data, _, is_complete, error in
+            guard let self = self else { return }
+            if let data = data, !data.isEmpty {
+                self.lock.lock()
+                self.response_data.append(data)
+                self.lock.unlock()
+            }
+            if let error = error {
+                self.finish(error: error)
+            } else if is_complete {
+                self.finish(error: nil)
+            } else {
+                self.receive(connection)
+            }
+        }
+    }
+
+    // 功能：只完成一次原始请求，并保存可能的网络错误。
+    // 参数：error 为连接错误；正常关闭时为 nil。
+    // 返回值：无。
+    private func finish(error: Error?) {
+        lock.lock()
+        guard !did_finish else {
+            lock.unlock()
+            return
+        }
+        did_finish = true
+        if let error = error { failure = error }
+        lock.unlock()
+        completed.signal()
+    }
+}
+
 private final class StreamingHTTPProbe: NSObject, URLSessionDataDelegate {
     private let expected_fragment: String
     private let lock = NSLock()
@@ -276,6 +394,7 @@ struct HTTPServerIntegrationTests {
         try test_gemini_stream_error(fake)
         try test_gemini_partial_stream_error(fake)
         try test_gemini_stream_propagates_cancellation(fake)
+        try test_gemini_invalid_path_arguments()
         try test_protocol_aware_not_found()
         try testTokenCount()
         try testInvalidToolChoices()
@@ -1242,6 +1361,29 @@ struct HTTPServerIntegrationTests {
         precondition(generic.status == 404)
         let generic_body = try jsonObject(generic.data)
         precondition(generic_body["error"] as? String == "not found")
+    }
+
+    // 功能：验证 action 形态合法的空模型和畸形 percent encoding
+    // 返回 Gemini 400。
+    // 参数：无。
+    // 返回值：无。
+    private static func test_gemini_invalid_path_arguments() throws {
+        let body = try JSONSerialization.data(withJSONObject: gemini_text_request())
+        let empty_model = try post(
+            path: "/v1beta/models/:generateContent",
+            payload: gemini_text_request())
+        let raw_probe = RawHTTPProbe()
+        let malformed_percent = try raw_probe.post(
+            port: testPort,
+            request_target: "/v1beta/models/gemini%GG:generateContent",
+            body: body)
+
+        for result in [empty_model, malformed_percent] {
+            precondition(result.status == 400)
+            let error = try jsonObject(result.data)["error"] as? [String: Any]
+            precondition(error?["code"] as? Int == 400)
+            precondition(error?["status"] as? String == "INVALID_ARGUMENT")
+        }
     }
 
     // 功能：验证四种 API key 入口、query 解码和三类协议的 401 envelope。

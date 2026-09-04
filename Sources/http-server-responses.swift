@@ -64,12 +64,12 @@ extension HTTPServer {
     ) {
         let gone = ClientGone()
         conn.stateUpdateHandler = { state in
-            if case .failed = state { gone.on = true }
-            if case .cancelled = state { gone.on = true }
+            if case .failed = state { gone.mark() }
+            if case .cancelled = state { gone.mark() }
         }
         conn.receive(minimumIncompleteLength: 1, maximumLength: 1) {
             _, _, is_complete, error in
-            if is_complete || error != nil { gone.on = true }
+            if is_complete || error != nil { gone.mark() }
         }
 
         var encoder = ResponsesStreamEncoder(
@@ -83,13 +83,13 @@ extension HTTPServer {
         do {
             try pipeline.stream_text(
                 context,
-                is_cancelled: { gone.on }
+                is_cancelled: { gone.is_set() }
             ) { delta in
-                guard !gone.on else { return }
+                guard !gone.is_set() else { return }
                 text += delta
                 self.sseSend(conn, encoder.text_delta(delta), gone: gone)
             }
-            guard !gone.on else { return }
+            guard !gone.is_set() else { return }
             let result = GatewayResult(
                 model: context.model.name,
                 text: text,
@@ -101,10 +101,10 @@ extension HTTPServer {
             let events = encoder.finish_text(result)
             send_responses_final_events(conn, events: events, gone: gone)
         } catch let error as GatewayProtocolError {
-            guard !gone.on else { return }
+            guard !gone.is_set() else { return }
             sseFinish(conn, encoder.error_event(error))
         } catch {
-            guard !gone.on else { return }
+            guard !gone.is_set() else { return }
             sseFinish(conn, encoder.error_event(.upstream("")))
         }
     }
@@ -137,10 +137,10 @@ extension HTTPServer {
             conn.cancel()
             return
         }
-        for event in events.dropLast() where !gone.on {
+        for event in events.dropLast() where !gone.is_set() {
             sseSend(conn, event, gone: gone)
         }
-        guard !gone.on else { return }
+        guard !gone.is_set() else { return }
         sseFinish(conn, final_event)
     }
 }

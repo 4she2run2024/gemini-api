@@ -85,14 +85,14 @@ extension HTTPServer {
     ) {
         let gone = ClientGone()
         conn.stateUpdateHandler = { state in
-            if case .failed = state { gone.on = true }
-            if case .cancelled = state { gone.on = true }
+            if case .failed = state { gone.mark() }
+            if case .cancelled = state { gone.mark() }
         }
         // 请求体已经读取完成；额外接收只用于在尚未发送 SSE 时
         // 感知客户端 EOF。
         conn.receive(minimumIncompleteLength: 1, maximumLength: 1) {
             _, _, is_complete, error in
-            if is_complete || error != nil { gone.on = true }
+            if is_complete || error != nil { gone.mark() }
         }
         let message_id = "msg_" + randomHex(24)
         let input_tokens = approximateTokenCount(context.execution.generation.prompt)
@@ -105,9 +105,9 @@ extension HTTPServer {
         do {
             try pipeline.stream_text(
                 context.execution,
-                is_cancelled: { gone.on },
+                is_cancelled: { gone.is_set() },
                 on_delta: { delta in
-                    guard !gone.on else { return }
+                    guard !gone.is_set() else { return }
                     raw_output += delta
                     self.sseSend(
                         conn,
@@ -115,16 +115,16 @@ extension HTTPServer {
                         gone: gone)
                 })
         } catch let error as GatewayProtocolError {
-            guard !gone.on else { return }
+            guard !gone.is_set() else { return }
             sseFinish(conn, anthropic_stream_error_event(
                 message: anthropic_error_message(error)))
             return
         } catch {
-            guard !gone.on else { return }
+            guard !gone.is_set() else { return }
             sseFinish(conn, anthropic_stream_error_event(message: "upstream error"))
             return
         }
-        guard !gone.on else { return }
+        guard !gone.is_set() else { return }
         sseFinish(conn, anthropic_text_stream_finish(
             output_tokens: approximateTokenCount(raw_output)))
     }

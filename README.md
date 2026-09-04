@@ -306,7 +306,7 @@ xattr -dr com.apple.quarantine "Gemini2API.app"
 ## 构建与测试
 
 ```bash
-# 七 endpoint HTTP integration 与全部 Swift 测试
+# 七 endpoint HTTP integration、全部 Swift 测试与 Release 脚本安全检查
 bash Tests/run-tests.sh --auto
 
 # 构建 Gemini2API.app
@@ -328,6 +328,7 @@ GitHub Actions 的 Test step 只调用统一 runner，随后构建 `Gemini2API.a
 - 增加 OpenAI Responses 与 Gemini GenerateContent 两类接口。
 - 以共享生成管线连接七个 endpoint，并补齐鉴权、错误与 SSE 契约。
 - 增加七 endpoint HTTP acceptance 和统一 CI 测试入口。
+- 增加线程安全取消状态与 Release 脚本废纸篓安全检查。
 - 增加真实 Gemini Web 上游与三个官方 SDK 的可重复 smoke test。
 
 ## 致谢与许可证

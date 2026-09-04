@@ -85,3 +85,5 @@ run_test gateway-pipeline-tests \
 run_test config-migration-tests \
   Sources/Config.swift \
   Tests/config-migration-tests.swift
+
+bash Tests/release-script-tests.sh

@@ -129,4 +129,20 @@ run_test gateway-runtime-tests \
   -framework Network \
   -framework CryptoKit
 
+run_test daemon-controller-tests \
+  "${GATEWAY_SOURCES[@]}" \
+  Sources/HTTPServer.swift \
+  Sources/HTTPServer+Anthropic.swift \
+  Sources/HTTPServer+OpenAI.swift \
+  Sources/http-server-gemini.swift \
+  Sources/http-server-responses.swift \
+  Sources/gateway-runtime.swift \
+  Sources/cli/cli-command.swift \
+  Sources/cli/runtime-state.swift \
+  Sources/cli/daemon-logger.swift \
+  Sources/cli/daemon-controller.swift \
+  Tests/daemon-controller-tests.swift \
+  -framework Network \
+  -framework CryptoKit
+
 bash Tests/release-script-tests.sh

@@ -10,6 +10,11 @@ binary_dir="$bundle/Contents/MacOS"
 zip_path="$app_name-macOS.zip"
 cli_binary="gemini2api-macOS"
 version="0.2.0"
+trash_sequence=0
+build_output_dir=""
+bundle_created=0
+cli_created=0
+build_succeeded=0
 
 # 功能：把已有产物或临时目录移入当前用户的 macOS 废纸篓。
 # 参数：首参数为待回收路径。
@@ -19,18 +24,41 @@ move_to_trash() {
   [[ -e "$target" || -L "$target" ]] || return 0
   local trash_dir="${HOME}/.Trash"
   local target_name
+  local trash_target
   target_name="$(basename "$target")"
   mkdir -p "$trash_dir"
-  mv "$target" "$trash_dir/${target_name}.$(date +%Y%m%d-%H%M%S).$$"
+  while true; do
+    trash_sequence=$((trash_sequence + 1))
+    trash_target="$trash_dir/${target_name}.$(date +%Y%m%d-%H%M%S).$$.$trash_sequence"
+    [[ ! -e "$trash_target" && ! -L "$trash_target" ]] && break
+  done
+  mv "$target" "$trash_target"
 }
+
+# 功能：保留构建退出码，并回收临时目录与失败时的新产物。
+# 参数：无；使用当前构建的路径和所有权标记。
+# 返回行为：不返回；以进入 EXIT trap 时的退出码结束。
+cleanup_build() {
+  local exit_status=$?
+  trap - EXIT
+  set +e
+  move_to_trash "$build_output_dir"
+  if [[ "$build_succeeded" -ne 1 ]]; then
+    [[ "$bundle_created" -eq 1 ]] && move_to_trash "$bundle"
+    [[ "$cli_created" -eq 1 ]] && move_to_trash "$cli_binary"
+  fi
+  exit "$exit_status"
+}
+
+trap cleanup_build EXIT
 
 move_to_trash "$bundle"
 move_to_trash "$zip_path"
 move_to_trash "$cli_binary"
+bundle_created=1
 mkdir -p "$binary_dir"
 
 build_output_dir="$(mktemp -d)"
-trap 'move_to_trash "$build_output_dir"' EXIT
 
 echo "编译中…（arm64 + x86_64 通用二进制）"
 shared_sources=(
@@ -88,6 +116,7 @@ swiftc -O -o "$build_output_dir/$cli_binary.arm64" "${cli_sources[@]}" \
   -target arm64-apple-macos13 "${cli_frameworks[@]}"
 swiftc -O -o "$build_output_dir/$cli_binary.x86_64" "${cli_sources[@]}" \
   -target x86_64-apple-macos13 "${cli_frameworks[@]}"
+cli_created=1
 lipo -create \
   "$build_output_dir/$cli_binary.arm64" \
   "$build_output_dir/$cli_binary.x86_64" \
@@ -138,3 +167,4 @@ lsregister_path+="Frameworks/LaunchServices.framework/Versions/A/Support/lsregis
 
 echo "完成：$(pwd)/$bundle"
 echo "完成：$(pwd)/$cli_binary"
+build_succeeded=1

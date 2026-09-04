@@ -59,7 +59,7 @@ extension HTTPServer {
         context: AnthropicRequestContext
     ) throws {
         if context.execution.request.stream && !context.execution.tool_policy.active {
-            try stream_anthropic_text(conn, pipeline: pipeline, context: context)
+            stream_anthropic_text(conn, pipeline: pipeline, context: context)
             return
         }
         let result = try pipeline.generate(context.execution)
@@ -75,15 +75,14 @@ extension HTTPServer {
         }
     }
 
-    // 功能：通过共享流式接口生成纯文本，
-    // 并按既有 Anthropic 事件顺序编码。
+    // 功能：在生成期间逐个转发纯文本 delta，并保持 Anthropic 事件顺序。
     // 参数：conn 为连接；pipeline 为共享管线；context 为执行上下文。
     // 返回值：无。
     private func stream_anthropic_text(
         _ conn: NWConnection,
         pipeline: GatewayPipeline,
         context: AnthropicRequestContext
-    ) throws {
+    ) {
         let gone = ClientGone()
         conn.stateUpdateHandler = { state in
             if case .failed = state { gone.on = true }
@@ -95,20 +94,39 @@ extension HTTPServer {
             _, _, is_complete, error in
             if is_complete || error != nil { gone.on = true }
         }
+        let message_id = "msg_" + randomHex(24)
+        let input_tokens = approximateTokenCount(context.execution.generation.prompt)
         var raw_output = ""
-        try pipeline.stream_text(
-            context.execution,
-            is_cancelled: { gone.on },
-            on_delta: { raw_output += $0 })
-        guard !gone.on else { return }
-        let output = ParsedToolOutput(text: raw_output, calls: [])
-        let message = makeAnthropicMessage(AnthropicMessageBuildInput(
-            model: context.execution.model.name,
-            prompt: context.execution.generation.prompt,
-            rawOutput: raw_output,
-            output: output))
         startSSE(conn)
-        sseFinish(conn, anthropicSSE(message))
+        sseSend(conn, anthropic_text_stream_start(
+            message_id: message_id,
+            model: context.execution.model.name,
+            input_tokens: input_tokens), gone: gone)
+        do {
+            try pipeline.stream_text(
+                context.execution,
+                is_cancelled: { gone.on },
+                on_delta: { delta in
+                    guard !gone.on else { return }
+                    raw_output += delta
+                    self.sseSend(
+                        conn,
+                        anthropic_text_stream_delta(delta),
+                        gone: gone)
+                })
+        } catch let error as GatewayProtocolError {
+            guard !gone.on else { return }
+            sseFinish(conn, anthropic_stream_error_event(
+                message: anthropic_error_message(error)))
+            return
+        } catch {
+            guard !gone.on else { return }
+            sseFinish(conn, anthropic_stream_error_event(message: "upstream error"))
+            return
+        }
+        guard !gone.on else { return }
+        sseFinish(conn, anthropic_text_stream_finish(
+            output_tokens: approximateTokenCount(raw_output)))
     }
 
     private func sendAnthropicError(_ conn: NWConnection, status: Int, message: String) {

@@ -357,6 +357,75 @@ func anthropicSSE(_ message: [String: Any]) -> String {
     return events.joined()
 }
 
+// 功能：编码纯文本流在生成前必须发送的 message 与 content block 起始事件。
+// 参数：message_id 为稳定消息 ID；model 为模型；input_tokens 为输入用量。
+// 返回值：按协议顺序拼接的两条 SSE 事件。
+func anthropic_text_stream_start(
+    message_id: String,
+    model: String,
+    input_tokens: Int
+) -> String {
+    let message: [String: Any] = [
+        "id": message_id,
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [],
+        "stop_reason": NSNull(),
+        "stop_sequence": NSNull(),
+        "usage": ["input_tokens": input_tokens, "output_tokens": 0],
+    ]
+    let block: [String: Any] = [
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": ["type": "text", "text": ""],
+    ]
+    return anthropicEvent(
+        "message_start",
+        payload: ["type": "message_start", "message": message])
+        + anthropicEvent("content_block_start", payload: block)
+}
+
+// 功能：把一个上游文本增量编码为 Anthropic content_block_delta。
+// 参数：text 为本次增量。
+// 返回值：单条 SSE 事件。
+func anthropic_text_stream_delta(_ text: String) -> String {
+    anthropicEvent("content_block_delta", payload: [
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": ["type": "text_delta", "text": text],
+    ])
+}
+
+// 功能：编码成功文本流的 block、message 结束事件及最终输出用量。
+// 参数：output_tokens 为完整输出的近似 token 数。
+// 返回值：按协议顺序拼接的三条 SSE 事件。
+func anthropic_text_stream_finish(output_tokens: Int) -> String {
+    let block_stop = anthropicEvent("content_block_stop", payload: [
+        "type": "content_block_stop",
+        "index": 0,
+    ])
+    let message_delta = anthropicEvent("message_delta", payload: [
+        "type": "message_delta",
+        "delta": ["stop_reason": "end_turn", "stop_sequence": NSNull()],
+        "usage": ["output_tokens": output_tokens],
+    ])
+    let message_stop = anthropicEvent(
+        "message_stop",
+        payload: ["type": "message_stop"])
+    return block_stop + message_delta + message_stop
+}
+
+// 功能：在 SSE header 已写出后编码脱敏的 Anthropic api_error 事件。
+// 参数：message 为已经脱敏的客户端消息。
+// 返回值：单条 error SSE 事件。
+func anthropic_stream_error_event(message: String) -> String {
+    anthropicEvent("error", payload: [
+        "type": "error",
+        "error": ["type": "api_error", "message": message],
+    ])
+}
+
 private func anthropicMessageStartEvent(_ message: [String: Any]) -> String {
     let startMessage: [String: Any] = [
         "id": message["id"] ?? "msg_" + randomHex(24),

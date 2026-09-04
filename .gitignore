@@ -2,3 +2,6 @@ Gemini Free.app/
 *.zip
 *.dmg
 .DS_Store
+Gemini2API.app/
+Gemini2API-macOS.zip
+Gemini2API.dmg

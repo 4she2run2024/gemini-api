@@ -11,6 +11,18 @@ fi
 
 TEST_OUTPUT_DIR="$(mktemp -d)"
 
+GATEWAY_SOURCES=(
+  Sources/AnthropicProtocol.swift
+  Sources/Config.swift
+  Sources/Engine.swift
+  Sources/Models.swift
+  Sources/Prompt.swift
+  Sources/ToolCalling.swift
+  Sources/Util.swift
+  Sources/gateway-protocol.swift
+  Sources/gateway-pipeline.swift
+)
+
 # 功能：编译并执行一组 Swift 测试。
 # 首参数：测试名称，用作临时可执行文件名。
 # 其余参数：原样传递给 swiftc 的源文件和编译参数。
@@ -23,27 +35,25 @@ run_test() {
 }
 
 run_test stream-routing-tests \
-  Sources/Prompt.swift \
-  Sources/ToolCalling.swift \
-  Sources/AnthropicProtocol.swift \
-  Sources/Util.swift \
-  Tests/StreamRoutingTests.swift
+  "${GATEWAY_SOURCES[@]}" \
+  Tests/StreamRoutingTests.swift \
+  -framework CryptoKit
 
 run_test http-server-tests \
-  Sources/AnthropicProtocol.swift \
-  Sources/Config.swift \
-  Sources/Engine.swift \
+  "${GATEWAY_SOURCES[@]}" \
   Sources/HTTPServer.swift \
   Sources/HTTPServer+Anthropic.swift \
   Sources/HTTPServer+OpenAI.swift \
-  Sources/Models.swift \
-  Sources/Prompt.swift \
-  Sources/ToolCalling.swift \
-  Sources/Util.swift \
   Tests/HTTPServerIntegrationTests.swift \
   -framework Network \
   -framework CryptoKit
 
 run_test gateway-protocol-tests \
-  Sources/gateway-protocol.swift \
-  Tests/gateway-protocol-tests.swift
+  "${GATEWAY_SOURCES[@]}" \
+  Tests/gateway-protocol-tests.swift \
+  -framework CryptoKit
+
+run_test gateway-pipeline-tests \
+  "${GATEWAY_SOURCES[@]}" \
+  Tests/gateway-pipeline-tests.swift \
+  -framework CryptoKit

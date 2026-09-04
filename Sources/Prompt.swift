@@ -1,6 +1,7 @@
 import Foundation
 
-// OpenAI messages -> 单条 prompt（图片输入不支持，明确告知模型）
+// 用途：构建 OpenAI 与协议无关网关请求的单条 prompt，保留角色、工具调用和续轮结果。
+// 使用方法：协议适配器调用 messagesToPrompt 或 gateway_prompt，再把结果交给生成器。
 func messagesToPrompt(_ messages: [Any], tools: [Any]?, toolChoice: Any?) -> String {
     var parts: [String] = []
     if hasActiveTools(tools, toolChoice: toolChoice ?? "auto"),
@@ -102,6 +103,103 @@ private func decodeArguments(_ value: Any?) -> [String: Any]? {
 func toolCallBlock(name: String, arguments: [String: Any]) -> String {
     let payload: [String: Any] = ["name": name, "arguments": arguments]
     return "```tool_call\n\(jsonString(payload))\n```"
+}
+
+// 功能：把协议无关网关请求转换为 Gemini Web 使用的单条 prompt。
+// 参数：request 为已规范化的网关请求。
+// 返回值：包含角色、工具协议和续轮结果的 prompt；无有效消息时返回空串。
+func gateway_prompt(_ request: GatewayRequest) -> String {
+    let message_parts = request.messages.flatMap(gateway_message_parts)
+    guard !message_parts.isEmpty else { return "" }
+
+    var parts: [String] = []
+    let policy = gateway_tool_policy(request)
+    if policy.active,
+       let section = toolUseSection(
+           gateway_tool_dictionaries(request.tools),
+           toolChoice: gateway_tool_choice_dictionary(request.tool_choice)) {
+        parts.append(section)
+    }
+    parts.append(contentsOf: message_parts)
+    return parts.joined(separator: "\n\n")
+}
+
+// 功能：把一条网关消息转换为带角色标签的 prompt 片段。
+// 参数：message 为待转换消息。
+// 返回值：按原顺序排列的文本、工具调用和工具结果片段。
+private func gateway_message_parts(_ message: GatewayMessage) -> [String] {
+    var parts: [String] = []
+    var text_buffer: [String] = []
+
+    func flush_text() {
+        guard !text_buffer.isEmpty else { return }
+        let text = text_buffer.joined(separator: " ")
+        parts.append("\(gateway_role_header(message.role))\n\(text)")
+        text_buffer.removeAll()
+    }
+
+    for content in message.content {
+        if case .text(let text) = content {
+            if !text.isEmpty { text_buffer.append(text) }
+            continue
+        }
+
+        flush_text()
+        switch content {
+        case .tool_call(let call):
+            parts.append(toolCallBlock(name: call.name, arguments: call.arguments))
+        case .tool_result(let result):
+            let identifier = gateway_tool_result_identifier(result)
+            parts.append("[Tool result for \(identifier)]\n\(gateway_output_text(result.output))")
+        case .text:
+            break
+        }
+    }
+    flush_text()
+    return parts
+}
+
+// 功能：返回网关角色对应的 prompt 标签。
+// 参数：role 为消息角色。
+// 返回值：准确的角色标签。
+private func gateway_role_header(_ role: GatewayRole) -> String {
+    switch role {
+    case .system: return "[System instruction]"
+    case .developer: return "[Developer instruction]"
+    case .user: return "[User]"
+    case .assistant: return "[Assistant]"
+    case .tool: return "[Tool]"
+    }
+}
+
+// 功能：选择工具结果的实际名称或调用 ID。
+// 参数：result 为工具结果。
+// 返回值：工具名称优先，其次调用 ID，均缺失时为 unknown。
+private func gateway_tool_result_identifier(_ result: GatewayToolResult) -> String {
+    if let name = result.name, !name.isEmpty { return name }
+    if let call_id = result.call_id, !call_id.isEmpty { return call_id }
+    return "unknown"
+}
+
+// 功能：把任意工具输出转换为可读 prompt 文本。
+// 参数：output 为工具输出。
+// 返回值：字符串原样返回，其他 JSON 值序列化。
+private func gateway_output_text(_ output: Any) -> String {
+    if let text = output as? String { return text }
+    if JSONSerialization.isValidJSONObject(output) { return jsonString(output) }
+    return String(describing: output)
+}
+
+// 功能：把网关工具选择转换为现有工具提示词可识别的结构。
+// 参数：choice 为网关工具选择。
+// 返回值：字符串策略或指定工具字典。
+private func gateway_tool_choice_dictionary(_ choice: GatewayToolChoice) -> Any {
+    switch choice {
+    case .auto: return "auto"
+    case .none: return "none"
+    case .required: return "required"
+    case .named(let name): return ["type": "tool", "name": name]
+    }
 }
 
 private func toolChoiceInstruction(_ value: Any?) -> String {

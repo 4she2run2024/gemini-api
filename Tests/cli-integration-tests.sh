@@ -9,10 +9,73 @@ if [[ $# -gt 1 || (${1:-} != "" && ${1:-} != "--auto") ]]; then
   exit 2
 fi
 
-command -v python3 >/dev/null
+# 功能：判断 Python candidate 是否包含当前 host 架构且能快速运行 Python 3。
+# 参数：首参数为 candidate 路径，次参数为 uname 返回的 host 架构。
+# 返回行为：架构匹配且无副作用探测成功时返回零，否则返回一。
+python_candidate_is_usable() {
+  local candidate="$1"
+  local host_arch="$2"
+  local file_description
+  [[ -x "$candidate" ]] || return 1
+  file_description="$(file -L -b "$candidate" 2>/dev/null)" || return 1
+  [[ "$file_description" == *"Mach-O"* ]] || return 1
+  [[ "$file_description" == *"$host_arch"* ]] || return 1
+  "$candidate" -c \
+    'import sys; raise SystemExit(0 if sys.version_info.major == 3 else 1)' \
+    </dev/null >/dev/null 2>&1
+}
+
+# 功能：优先解析 Command Line Tools Python，再检查 PATH 中的兼容 candidate。
+# 参数：无。
+# 返回行为：stdout 输出首个通过 host 架构和运行探测的路径；
+# 无可用项时失败。
+resolve_python_binary() {
+  local host_arch
+  local xcrun_candidate
+  local path_entry
+  local path_candidate
+  local -a path_entries
+  host_arch="$(uname -m)"
+  xcrun_candidate="$(xcrun --find python3 2>/dev/null || true)"
+  if [[ -n "$xcrun_candidate" ]] \
+    && python_candidate_is_usable "$xcrun_candidate" "$host_arch"; then
+    printf '%s\n' "$xcrun_candidate"
+    return 0
+  fi
+  IFS=':' read -r -a path_entries <<<"$PATH"
+  for path_entry in "${path_entries[@]}"; do
+    [[ -n "$path_entry" ]] || path_entry="."
+    path_candidate="$path_entry/python3"
+    if python_candidate_is_usable "$path_candidate" "$host_arch"; then
+      printf '%s\n' "$path_candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 command -v curl >/dev/null
+command -v file >/dev/null
 
 test_root="$(mktemp -d)"
+path_python_marker="$test_root/path-python-used.txt"
+path_shim_directory="$test_root/path-shims"
+mkdir -p "$path_shim_directory"
+cat >"$path_shim_directory/python3" <<'BASH'
+#!/bin/bash
+printf '%s\n' "unexpected PATH python3" >"${GEMINI2API_PATH_PYTHON_MARKER:?}"
+printf '%s\n' "PATH python3 shim was executed" >&2
+exit 97
+BASH
+chmod 700 "$path_shim_directory/python3"
+export GEMINI2API_PATH_PYTHON_MARKER="$path_python_marker"
+export PATH="$path_shim_directory:$PATH"
+if ! python_binary="$(resolve_python_binary)"; then
+  echo "找不到与当前 host 架构兼容的 Python 3" >&2
+  exit 1
+fi
+[[ "$python_binary" != "$path_shim_directory/python3" ]]
+
 helper_source="$test_root/cli-integration-main.swift"
 cli_binary="$test_root/gemini2api-cli-tests"
 pid_file="$test_root/helper-pids.txt"
@@ -72,7 +135,7 @@ register_pending_pids() {
     [[ "$current_path" == "$cli_binary_identity" ]] || continue
     candidate_command="$(ps -p "$helper_pid" -o command= 2>/dev/null || true)"
     candidate_program="${candidate_command%% *}"
-    candidate_identity="$(python3 - "$candidate_program" <<'PYTHON' 2>/dev/null || true
+    candidate_identity="$("$python_binary" - "$candidate_program" <<'PYTHON' 2>/dev/null || true
 import os
 import sys
 print(os.path.realpath(sys.argv[1]))
@@ -110,7 +173,7 @@ register_state_pid() {
   local state_executable_path
   local state_started_at
   [[ -f "$state_path" ]] || return 0
-  state_identity="$(python3 - "$state_path" <<'PYTHON' 2>/dev/null || true
+  state_identity="$("$python_binary" - "$state_path" <<'PYTHON' 2>/dev/null || true
 import json
 import sys
 with open(sys.argv[1], encoding="utf-8") as handle:
@@ -163,7 +226,7 @@ register_hidden_children() {
       || continue
     candidate_program="${candidate_command%% *}"
     candidate_program_identity="$(
-      python3 - "$candidate_program" <<'PYTHON' 2>/dev/null || true
+      "$python_binary" - "$candidate_program" <<'PYTHON' 2>/dev/null || true
 import os
 import sys
 print(os.path.realpath(sys.argv[1]))
@@ -493,7 +556,7 @@ gateway_sources=(
 swiftc -D GEMINI2API_LIBRARY \
   "${gateway_sources[@]}" "$helper_source" \
   -framework Network -framework CryptoKit -o "$cli_binary"
-cli_binary_identity="$(python3 - "$cli_binary" <<'PYTHON'
+cli_binary_identity="$("$python_binary" - "$cli_binary" <<'PYTHON'
 import os
 import sys
 print(os.path.realpath(sys.argv[1]))
@@ -504,7 +567,7 @@ PYTHON
 # 参数：无。
 # 返回行为：stdout 输出端口。
 random_port() {
-  python3 - <<'PYTHON'
+  "$python_binary" - <<'PYTHON'
 import socket
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
     sock.bind(("127.0.0.1", 0))
@@ -551,7 +614,7 @@ wait_for_http() {
 record_daemon_pid() {
   local state_path="$test_root/support/Gemini2API/runtime/daemon.json"
   local daemon_pid
-  daemon_pid="$(python3 - "$state_path" <<'PYTHON'
+  daemon_pid="$("$python_binary" - "$state_path" <<'PYTHON'
 import json
 import sys
 with open(sys.argv[1], encoding="utf-8") as handle:
@@ -591,7 +654,7 @@ JSON
 chmod 600 "$config_directory/config.json"
 
 for invalid_config_case in host port model; do
-  python3 - "$config_directory/config.json" "$invalid_config_case" <<'PYTHON'
+  "$python_binary" - "$config_directory/config.json" "$invalid_config_case" <<'PYTHON'
 import json
 import sys
 
@@ -629,7 +692,7 @@ if [[ -e "$generator_marker" ]]; then
   mv "$generator_marker" "$test_root/status-generator-resolution.txt"
 fi
 
-python3 - "$config_directory/config.json" <<'PYTHON'
+"$python_binary" - "$config_directory/config.json" <<'PYTHON'
 import json
 import sys
 
@@ -651,7 +714,7 @@ if [[ -n ${GEMINI2API_TEST_STATE_CLEANUP_MODE:-} ]]; then
   state_cleanup_started_at="${GEMINI2API_TEST_STATE_CLEANUP_STARTED_AT:?}"
   state_cleanup_file="$test_root/support/Gemini2API/runtime/daemon.json"
   mkdir -p "$(dirname "$state_cleanup_file")"
-  python3 - \
+  "$python_binary" - \
     "$state_cleanup_mode" \
     "$state_cleanup_pid" \
     "$state_cleanup_path" \
@@ -699,7 +762,7 @@ run_state_cleanup_identity_probe() {
   local sentinel_path
   local sentinel_started_at
   local probe_code
-  python3 - "$term_marker" "$ready_marker" <<'PYTHON' &
+  "$python_binary" - "$term_marker" "$ready_marker" <<'PYTHON' &
 import pathlib
 import signal
 import sys
@@ -803,7 +866,7 @@ kill -0 "$daemon_pid"
 wait_for_http "$daemon_port"
 [[ "$(run_cli status)" == *"running"* ]]
 status_json="$(run_cli status --json)"
-python3 - "$status_json" "$daemon_pid" "$daemon_port" <<'PYTHON'
+"$python_binary" - "$status_json" "$daemon_pid" "$daemon_port" <<'PYTHON'
 import json
 import sys
 value = json.loads(sys.argv[1])
@@ -894,7 +957,7 @@ swift -e '
 ' "$state_directory/daemon.json"
 
 owner_port="$(random_port)"
-python3 -m http.server "$owner_port" --bind 127.0.0.1 \
+"$python_binary" -m http.server "$owner_port" --bind 127.0.0.1 \
   >"$test_root/owner.out" 2>"$test_root/owner.err" &
 port_owner_pid=$!
 record_pid "$port_owner_pid"
@@ -911,7 +974,8 @@ kill -TERM "$port_owner_pid"
 wait "$port_owner_pid" 2>/dev/null || true
 
 timeout_port="$(random_port)"
-python3 -c 'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(1)' &
+"$python_binary" -c \
+  'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(1)' &
 timeout_owner_pid=$!
 record_pid "$timeout_owner_pid"
 sleep 0.1
@@ -957,5 +1021,6 @@ done <"$pid_file"
 [[ ! -e "$state_directory/daemon.json" ]]
 ! find "$state_directory" -name '*.staging' -print -quit | grep -q .
 ! pgrep -f "$cli_binary" >/dev/null
+[[ ! -e "$path_python_marker" ]]
 
 echo "cli-integration-tests passed"

@@ -44,6 +44,7 @@ run_test http-server-tests \
   Sources/HTTPServer.swift \
   Sources/HTTPServer+Anthropic.swift \
   Sources/HTTPServer+OpenAI.swift \
+  Sources/http-server-gemini.swift \
   Sources/http-server-responses.swift \
   Tests/HTTPServerIntegrationTests.swift \
   -framework Network \
@@ -54,8 +55,20 @@ run_test responses-protocol-tests \
   Sources/HTTPServer.swift \
   Sources/HTTPServer+Anthropic.swift \
   Sources/HTTPServer+OpenAI.swift \
+  Sources/http-server-gemini.swift \
   Sources/http-server-responses.swift \
   Tests/responses-protocol-tests.swift \
+  -framework Network \
+  -framework CryptoKit
+
+run_test gemini-protocol-tests \
+  "${GATEWAY_SOURCES[@]}" \
+  Sources/HTTPServer.swift \
+  Sources/HTTPServer+Anthropic.swift \
+  Sources/HTTPServer+OpenAI.swift \
+  Sources/http-server-gemini.swift \
+  Sources/http-server-responses.swift \
+  Tests/gemini-protocol-tests.swift \
   -framework Network \
   -framework CryptoKit
 

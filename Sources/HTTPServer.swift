@@ -1,7 +1,8 @@
 import Foundation
 import Network
 
-// 极简 HTTP/1.1 服务：实现 OpenAI Chat Completions 与 Anthropic Messages 端点
+// 用途：提供 OpenAI、Anthropic 与 Gemini 兼容的极简 HTTP/1.1 路由和写出层。
+// 使用方法：以生成器和配置初始化 HTTPServer，再调用 start 启动监听。
 final class HTTPServer {
     static let shared = HTTPServer(generator: Engine.shared, config: Store.shared)
     private var listener: NWListener?
@@ -140,6 +141,10 @@ final class HTTPServer {
         case ("POST", "/v1/messages/count_tokens"):
             handleAnthropicTokenCount(conn, body: body)
         default:
+            if method == "POST", let gemini_route = try? parse_gemini_route(path) {
+                handle_gemini(conn, body: body, route: gemini_route)
+                return
+            }
             sendJSON(conn, ["error": "not found"], status: 404)
         }
     }

@@ -81,3 +81,7 @@ run_test gateway-pipeline-tests \
   "${GATEWAY_SOURCES[@]}" \
   Tests/gateway-pipeline-tests.swift \
   -framework CryptoKit
+
+run_test config-migration-tests \
+  Sources/Config.swift \
+  Tests/config-migration-tests.swift

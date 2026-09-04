@@ -2,8 +2,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP="Gemini Free"
-DMG="GeminiFree.dmg"
+APP="Gemini2API"
+DMG="Gemini2API.dmg"
 
 # 需要 create-dmg：brew install create-dmg
 command -v create-dmg >/dev/null || { echo "请先安装：brew install create-dmg"; exit 1; }

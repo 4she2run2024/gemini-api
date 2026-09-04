@@ -1,6 +1,7 @@
 import AppKit
 
-// 极简设置窗口：端口 / API Key / Cookie / 代理 / 默认模型 / 认证参数
+// 用途：构建 Gemini2API 的端口、鉴权和上游参数设置窗口。
+// 使用方法：由 AppDelegate 调用 make(onSave:) 创建窗口。
 enum SettingsWindow {
     private final class Controller: NSObject {
         let cfg = Store.shared
@@ -44,7 +45,7 @@ enum SettingsWindow {
 
         let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 380),
                            styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        win.title = "Gemini Free 设置"
+        win.title = "Gemini2API 设置"
         win.center()
         ctl.window = win
         objc_setAssociatedObject(win, "ctl", ctl, .OBJC_ASSOCIATION_RETAIN)

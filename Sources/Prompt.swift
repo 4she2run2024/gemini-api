@@ -74,7 +74,7 @@ private func openAIContent(_ value: Any?) -> String {
         let type = block["type"] as? String
         if type == "text" || type == "input_text" { return block["text"] as? String ?? "" }
         if type == "image_url" || type == "image" {
-            return "[Image input is not supported by Gemini Free.]"
+            return "[Image input is not supported by Gemini2API.]"
         }
         return nil
     }.joined(separator: " ")

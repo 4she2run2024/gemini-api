@@ -2,10 +2,10 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP="Gemini Free"
+APP="Gemini2API"
 BUNDLE="$APP.app"
 BINDIR="$BUNDLE/Contents/MacOS"
-VERSION="1.5"
+VERSION="0.1.0"
 
 rm -rf "$BUNDLE"
 mkdir -p "$BINDIR"
@@ -34,8 +34,8 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
 <plist version="1.0">
 <dict>
   <key>CFBundleName</key><string>$APP</string>
-  <key>CFBundleDisplayName</key><string>Gemini Free</string>
-  <key>CFBundleIdentifier</key><string>com.geminirelay.app</string>
+  <key>CFBundleDisplayName</key><string>$APP</string>
+  <key>CFBundleIdentifier</key><string>com.gemini2api.gateway</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleExecutable</key><string>$APP</string>

@@ -11,6 +11,20 @@ fi
 
 TEST_OUTPUT_DIR="$(mktemp -d)"
 
+# 功能：把测试编译产物移入当前用户废纸篓。
+# 参数：无；使用 TEST_OUTPUT_DIR。
+# 返回行为：回收失败时仅报告错误，不覆盖原测试退出码。
+recycle_test_output() {
+  swift -e '
+    import Foundation
+    var recycled_url: NSURL?
+    try FileManager.default.trashItem(
+      at: URL(fileURLWithPath: CommandLine.arguments[1]),
+      resultingItemURL: &recycled_url)
+  ' "$TEST_OUTPUT_DIR" || echo "测试编译产物回收失败" >&2
+}
+trap recycle_test_output EXIT
+
 GATEWAY_SOURCES=(
   Sources/AnthropicProtocol.swift
   Sources/Config.swift
@@ -90,6 +104,12 @@ run_test cli-command-tests \
   Sources/Models.swift \
   Sources/cli/cli-command.swift \
   Tests/cli-command-tests.swift
+
+run_test runtime-state-tests \
+  Sources/Models.swift \
+  Sources/cli/cli-command.swift \
+  Sources/cli/runtime-state.swift \
+  Tests/runtime-state-tests.swift
 
 run_test gateway-runtime-tests \
   "${GATEWAY_SOURCES[@]}" \

@@ -4,6 +4,7 @@
 
 import Darwin
 import Foundation
+import Network
 
 @_silgen_name("fork")
 private func system_fork() -> pid_t
@@ -11,6 +12,7 @@ private func system_fork() -> pid_t
 private let HEALTH_CHECK_TIMEOUT_SECONDS: TimeInterval = 2
 private let STOP_POLL_INTERVAL_SECONDS: TimeInterval = 0.02
 private let DAEMON_READINESS_TIMEOUT_SECONDS: TimeInterval = 10
+private let DAEMON_REAP_TIMEOUT_SECONDS: TimeInterval = 0.25
 
 private enum DaemonReadiness: UInt8 {
     case ready = 1
@@ -117,6 +119,21 @@ private final class HealthResultBox {
     }
 }
 
+private final class RedirectDenyingSessionDelegate: NSObject, URLSessionTaskDelegate {
+    // 功能：拒绝自动跟随 redirect，确保分类只依据直接根路由响应。
+    // 参数：session、task、response 和 request 来自 URLSession；handler 接收决定。
+    // 返回值：无；始终以 nil 拒绝 redirect。
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
+    }
+}
+
 struct URLSessionHealthChecker: HealthChecking {
     // 功能：以临时 URLSession 同步探测 GET / 并严格验证响应结构。
     // 参数：host、port 为目标地址；timeout 为最长等待秒数。
@@ -132,7 +149,11 @@ struct URLSessionHealthChecker: HealthChecking {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = timeout
         configuration.timeoutIntervalForResource = timeout
-        let session = URLSession(configuration: configuration)
+        let redirect_delegate = RedirectDenyingSessionDelegate()
+        let session = URLSession(
+            configuration: configuration,
+            delegate: redirect_delegate,
+            delegateQueue: nil)
         let completed = DispatchSemaphore(value: 0)
         let result_box = HealthResultBox()
         var request = URLRequest(url: url)
@@ -226,6 +247,7 @@ final class DaemonController {
     // 返回值：ready、冲突或运行时失败对应的 CLI 退出码。
     func serve_daemon(options: ServeOptions) -> CLIExitCode {
         guard options.daemon else { return .usage }
+        guard ensure_standard_descriptors() else { return .runtime }
         let daemon_lock: DaemonLock
         do {
             daemon_lock = try state_store.acquire_lock()
@@ -272,6 +294,7 @@ final class DaemonController {
         _ = Darwin.close(pipe_descriptors[0])
         switch readiness {
         case .message(.ready):
+            daemon_lock.relinquish_after_fork_in_parent()
             return .success
         case .message(.conflict):
             reap_child(child_pid)
@@ -281,7 +304,9 @@ final class DaemonController {
             return .runtime
         case .timeout:
             _ = signal_sender(child_pid, SIGTERM)
-            reap_child(child_pid)
+            reap_child_if_exited(
+                child_pid,
+                timeout: DAEMON_REAP_TIMEOUT_SECONDS)
             return .runtime
         }
     }
@@ -441,8 +466,9 @@ final class DaemonController {
         daemon_lock: DaemonLock
     ) -> Never {
         _ = daemon_lock
+        _ = Darwin.signal(SIGPIPE, SIG_IGN)
         guard setsid() >= 0, redirect_stdin_to_null() else {
-            write_readiness(.runtime_failure, to: readiness_descriptor)
+            _ = write_readiness(.runtime_failure, to: readiness_descriptor)
             _ = Darwin.close(readiness_descriptor)
             _exit(CLIExitCode.runtime.rawValue)
         }
@@ -495,8 +521,10 @@ final class DaemonController {
                     "pid": String(getpid()),
                 ])
             outcome = .ready
-        } catch GatewayRuntimeError.listener_failed {
-            outcome = .conflict
+        } catch GatewayRuntimeError.listener_failed(let error) {
+            outcome = daemon_listener_exit_code(error) == .conflict
+                ? .conflict
+                : .runtime_failure
         } catch {
             outcome = .runtime_failure
         }
@@ -512,9 +540,19 @@ final class DaemonController {
                 ])
         }
 
-        write_readiness(outcome, to: readiness_descriptor)
+        let readiness_written = write_readiness(outcome, to: readiness_descriptor)
         _ = Darwin.close(readiness_descriptor)
-        guard outcome == .ready, let published_state else {
+        if outcome == .ready && !readiness_written {
+            logger?.write(
+                .error,
+                event: "daemon_error",
+                fields: [
+                    "stage": "readiness",
+                    "pid": String(getpid()),
+                    "error_category": "system_call_failed",
+                ])
+        }
+        guard outcome == .ready, readiness_written, let published_state else {
             runtime?.stop()
             logger?.stop()
             if let published_state {
@@ -550,14 +588,52 @@ private enum DaemonChildError: Error {
     case identity_unavailable
 }
 
+// 功能：仅把已确认 EADDRINUSE 的 listener 错误映射为端口冲突。
+// 参数：error 为 GatewayRuntimeError.listener_failed 的底层错误。
+// 返回值：地址占用为 conflict，其余系统和权限失败为 runtime。
+func daemon_listener_exit_code(_ error: Error) -> CLIExitCode {
+    if let network_error = error as? NWError,
+       case .posix(let code) = network_error,
+       code == .EADDRINUSE {
+        return .conflict
+    }
+    if let posix_error = error as? POSIXError,
+       posix_error.code == .EADDRINUSE {
+        return .conflict
+    }
+    return .runtime
+}
+
 // 功能：让 daemon child 的 stdin 指向操作系统空设备。
 // 参数：无。
 // 返回值：打开和 dup2 均成功时为 true。
-private func redirect_stdin_to_null() -> Bool {
+func redirect_stdin_to_null() -> Bool {
     let descriptor = Darwin.open("/dev/null", O_RDONLY | O_CLOEXEC)
     guard descriptor >= 0 else { return false }
-    defer { _ = Darwin.close(descriptor) }
-    return Darwin.dup2(descriptor, STDIN_FILENO) >= 0
+    if descriptor == STDIN_FILENO { return true }
+    let redirected = Darwin.dup2(descriptor, STDIN_FILENO) >= 0
+    _ = Darwin.close(descriptor)
+    return redirected
+}
+
+// 功能：在获取 lock 和创建 pipe 前用空设备补齐标准 fd，
+// 保证后续 fd 均不低于 3。
+// 参数：无。
+// 返回值：三个标准 fd 均有效时为 true，否则为 false。
+private func ensure_standard_descriptors() -> Bool {
+    for descriptor in [STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO] {
+        errno = 0
+        if fcntl(descriptor, F_GETFD) >= 0 { continue }
+        guard errno == EBADF else { return false }
+        let access_mode = descriptor == STDIN_FILENO ? O_RDONLY : O_WRONLY
+        let null_descriptor = Darwin.open("/dev/null", access_mode | O_CLOEXEC)
+        guard null_descriptor >= 0 else { return false }
+        if null_descriptor == descriptor { continue }
+        let duplicated = Darwin.dup2(null_descriptor, descriptor) >= 0
+        _ = Darwin.close(null_descriptor)
+        guard duplicated else { return false }
+    }
+    return true
 }
 
 // 功能：为 readiness pipe 设置 close-on-exec，避免未来 exec 泄漏。
@@ -571,15 +647,15 @@ private func set_close_on_exec_best_effort(_ descriptor: Int32) {
 
 // 功能：向 pipe 完整写入一个固定 readiness 枚举 byte。
 // 参数：message 为固定分类；descriptor 为 child pipe 写端。
-// 返回值：无；父进程消失时尽快结束 child 启动路径。
-private func write_readiness(_ message: DaemonReadiness, to descriptor: Int32) {
+// 返回值：完整写入时为 true；EPIPE 或其他失败时为 false。
+private func write_readiness(_ message: DaemonReadiness, to descriptor: Int32) -> Bool {
     var byte = message.rawValue
     while true {
         let count = withUnsafePointer(to: &byte) { pointer in
             Darwin.write(descriptor, pointer, 1)
         }
         if count < 0 && errno == EINTR { continue }
-        return
+        return count == 1
     }
 }
 
@@ -622,5 +698,22 @@ private func reap_child(_ pid: Int32) {
     var status: Int32 = 0
     while waitpid(pid, &status, 0) < 0 {
         if errno != EINTR { return }
+    }
+}
+
+// 功能：在固定短期限内尝试回收精确 child，不阻塞 daemon parent 退出。
+// 参数：pid 为 fork 返回的 child；timeout 为最长等待秒数。
+// 返回值：期限内已回收或已无 child 时为 true，否则为 false。
+@discardableResult
+private func reap_child_if_exited(_ pid: Int32, timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while true {
+        var status: Int32 = 0
+        let result = waitpid(pid, &status, WNOHANG)
+        if result == pid || (result < 0 && errno == ECHILD) { return true }
+        if result < 0 && errno != EINTR { return false }
+        let remaining = deadline.timeIntervalSinceNow
+        guard remaining > 0 else { return false }
+        Thread.sleep(forTimeInterval: min(STOP_POLL_INTERVAL_SECONDS, remaining))
     }
 }

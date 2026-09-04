@@ -4,6 +4,9 @@
 import Darwin
 import Foundation
 
+@_silgen_name("fork")
+private func test_system_fork() -> pid_t
+
 private enum RuntimeStateTestError: Error {
     case expected_failure
     case permission_denied
@@ -69,6 +72,7 @@ struct RuntimeStateTests {
         try test_permissions_and_json_round_trip(test_root: test_root)
         try test_atomic_publish_and_recycling(test_root: test_root)
         try test_exclusive_lock_is_retained(test_root: test_root)
+        try test_parent_relinquish_preserves_child_lock(test_root: test_root)
         try test_symlink_and_non_directory_targets_are_rejected(test_root: test_root)
         try test_identity_classification(test_root: test_root)
         try test_darwin_current_process_identity(test_root: test_root)
@@ -193,6 +197,40 @@ struct RuntimeStateTests {
         let second_lock = try fixture.store.acquire_lock()
         second_lock.unlock()
         precondition(FileManager.default.fileExists(atPath: fixture.paths.lock_path.path))
+    }
+
+    // 功能：验证 fork 后 parent 仅关闭自身 descriptor，
+    // 不解除 child 持有的 flock。
+    // 参数：test_root 为隔离测试总目录。
+    // 返回值：无；child 存活时可重取锁或退出后仍不可重取时终止测试。
+    private static func test_parent_relinquish_preserves_child_lock(
+        test_root: URL
+    ) throws {
+        let fixture = try make_fixture(test_root: test_root, name: "fork-lock")
+        let inherited_lock = try fixture.store.acquire_lock()
+        let child_pid = test_system_fork()
+        precondition(child_pid >= 0)
+        if child_pid == 0 {
+            while true { _ = pause() }
+        }
+        var child_needs_cleanup = true
+        defer {
+            if child_needs_cleanup {
+                _ = Darwin.kill(child_pid, SIGTERM)
+                var status: Int32 = 0
+                while waitpid(child_pid, &status, 0) < 0 && errno == EINTR {}
+            }
+        }
+
+        inherited_lock.relinquish_after_fork_in_parent()
+        try expect_throw { _ = try fixture.store.acquire_lock() }
+
+        precondition(Darwin.kill(child_pid, SIGTERM) == 0)
+        var status: Int32 = 0
+        while waitpid(child_pid, &status, 0) < 0 && errno == EINTR {}
+        child_needs_cleanup = false
+        let replacement_lock = try fixture.store.acquire_lock()
+        replacement_lock.unlock()
     }
 
     // 功能：验证受管目录、状态文件的 symlink 及非目录目标均被拒绝。

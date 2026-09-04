@@ -76,6 +76,17 @@ final class DaemonLock {
         descriptor = -1
     }
 
+    // 功能：fork 成功后仅关闭 parent 的 descriptor，不解除 child 继承的 flock。
+    // 参数：无。
+    // 返回值：无；重复调用保持幂等。
+    func relinquish_after_fork_in_parent() {
+        state_lock.lock()
+        defer { state_lock.unlock() }
+        guard descriptor >= 0 else { return }
+        _ = Darwin.close(descriptor)
+        descriptor = -1
+    }
+
     deinit {
         unlock()
     }

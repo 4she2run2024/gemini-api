@@ -1,11 +1,11 @@
 import Foundation
 import Network
 
+// 用途：通过共享生成管线处理 Anthropic Messages 与 token count 请求。
+// 使用方法：HTTPServer 路由调用对应 handler，并保留既有 Anthropic 响应格式。
+
 private struct AnthropicRequestContext {
-    let model: ResolvedModel
-    let generation: GenerationRequest
-    let stream: Bool
-    let toolPolicy: ToolCallPolicy
+    let execution: GatewayExecutionContext
 }
 
 extension HTTPServer {
@@ -15,14 +15,20 @@ extension HTTPServer {
             return
         }
         do {
-            let context = try anthropicContext(request)
-            try generateAnthropicMessage(conn, context: context)
-        } catch let error as AnthropicProtocolError {
-            sendAnthropicError(conn, status: 400, message: error.description)
-        } catch let error as ToolCallParseError {
-            sendAnthropicError(conn, status: 502, message: "upstream tool protocol error: \(error)")
+            let pipeline = GatewayPipeline(generator: generator, default_model: cfg.defaultModel)
+            let gateway_request = try parse_anthropic_request(
+                request,
+                default_model: cfg.defaultModel)
+            let context = AnthropicRequestContext(
+                execution: try pipeline.prepare(gateway_request))
+            try generateAnthropicMessage(conn, pipeline: pipeline, context: context)
+        } catch let error as GatewayProtocolError {
+            sendAnthropicError(
+                conn,
+                status: error.http_status,
+                message: anthropic_error_message(error))
         } catch {
-            sendAnthropicError(conn, status: 502, message: "upstream error: \(error)")
+            sendAnthropicError(conn, status: 502, message: "upstream error")
         }
     }
 
@@ -32,46 +38,36 @@ extension HTTPServer {
             return
         }
         do {
-            let prompt = try anthropicMessagesToPrompt(request)
+            let gateway_request = try parse_anthropic_request(
+                request,
+                default_model: cfg.defaultModel)
+            let prompt = gateway_prompt(gateway_request)
             sendJSON(conn, ["input_tokens": approximateTokenCount(prompt)])
+        } catch let error as GatewayProtocolError {
+            sendAnthropicError(
+                conn,
+                status: error.http_status,
+                message: anthropic_error_message(error))
         } catch {
-            sendAnthropicError(conn, status: 400, message: "\(error)")
+            sendAnthropicError(conn, status: 400, message: "invalid request")
         }
-    }
-
-    private func anthropicContext(_ request: [String: Any]) throws -> AnthropicRequestContext {
-        let modelName = request["model"] as? String ?? cfg.defaultModel
-        let model = resolveModel(modelName, defaultModel: cfg.defaultModel)
-        let prompt = try anthropicMessagesToPrompt(request)
-        let tools = request["tools"] as? [Any]
-        let toolChoice = request["tool_choice"] ?? ["type": "auto"]
-        let policy = toolCallPolicy(tools, toolChoice: toolChoice)
-        let generation = GenerationRequest(prompt: prompt, mode: model.mode, think: model.think, extra: model.extra)
-        return AnthropicRequestContext(
-            model: model,
-            generation: generation,
-            stream: request["stream"] as? Bool ?? false,
-            toolPolicy: policy)
     }
 
     private func generateAnthropicMessage(
-        _ conn: NWConnection, context: AnthropicRequestContext
+        _ conn: NWConnection,
+        pipeline: GatewayPipeline,
+        context: AnthropicRequestContext
     ) throws {
-        let rawOutput = try generator.generate(context.generation)
-        let output: ParsedToolOutput
-        if context.toolPolicy.active {
-            output = try parseStructuredToolCalls(
-                rawOutput, allowedToolNames: context.toolPolicy.allowedNames)
-            try context.toolPolicy.validate(output.calls)
-        } else {
-            output = ParsedToolOutput(text: rawOutput, calls: [])
+        if context.execution.request.stream && !context.execution.tool_policy.active {
+            stream_anthropic_text(conn, pipeline: pipeline, context: context)
+            return
         }
+        let result = try pipeline.generate(context.execution)
         let message = makeAnthropicMessage(AnthropicMessageBuildInput(
-            model: context.model.name,
-            prompt: context.generation.prompt,
-            rawOutput: rawOutput,
-            output: output))
-        if context.stream {
+            model: context.execution.model.name,
+            prompt: context.execution.generation.prompt,
+            result: result))
+        if context.execution.request.stream {
             startSSE(conn)
             sseFinish(conn, anthropicSSE(message))
         } else {
@@ -79,8 +75,73 @@ extension HTTPServer {
         }
     }
 
+    // 功能：在生成期间逐个转发纯文本 delta，并保持 Anthropic 事件顺序。
+    // 参数：conn 为连接；pipeline 为共享管线；context 为执行上下文。
+    // 返回值：无。
+    private func stream_anthropic_text(
+        _ conn: NWConnection,
+        pipeline: GatewayPipeline,
+        context: AnthropicRequestContext
+    ) {
+        let gone = ClientGone()
+        conn.stateUpdateHandler = { state in
+            if case .failed = state { gone.mark() }
+            if case .cancelled = state { gone.mark() }
+        }
+        // 请求体已经读取完成；额外接收只用于在尚未发送 SSE 时
+        // 感知客户端 EOF。
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 1) {
+            _, _, is_complete, error in
+            if is_complete || error != nil { gone.mark() }
+        }
+        let message_id = "msg_" + randomHex(24)
+        let input_tokens = approximateTokenCount(context.execution.generation.prompt)
+        var raw_output = ""
+        startSSE(conn)
+        sseSend(conn, anthropic_text_stream_start(
+            message_id: message_id,
+            model: context.execution.model.name,
+            input_tokens: input_tokens), gone: gone)
+        do {
+            try pipeline.stream_text(
+                context.execution,
+                is_cancelled: { gone.is_set() },
+                on_delta: { delta in
+                    guard !gone.is_set() else { return }
+                    raw_output += delta
+                    self.sseSend(
+                        conn,
+                        anthropic_text_stream_delta(delta),
+                        gone: gone)
+                })
+        } catch let error as GatewayProtocolError {
+            guard !gone.is_set() else { return }
+            sseFinish(conn, anthropic_stream_error_event(
+                message: anthropic_error_message(error)))
+            return
+        } catch {
+            guard !gone.is_set() else { return }
+            sseFinish(conn, anthropic_stream_error_event(message: "upstream error"))
+            return
+        }
+        guard !gone.is_set() else { return }
+        sseFinish(conn, anthropic_text_stream_finish(
+            output_tokens: approximateTokenCount(raw_output)))
+    }
+
     private func sendAnthropicError(_ conn: NWConnection, status: Int, message: String) {
         let type = status >= 500 ? "api_error" : "invalid_request_error"
-        sendJSON(conn, ["type": "error", "error": ["type": type, "message": message]], status: status)
+        let error: [String: Any] = [
+            "type": "error",
+            "error": ["type": type, "message": message],
+        ]
+        sendJSON(conn, error, status: status)
     }
+}
+
+// 功能：为统一错误恢复 Anthropic 既有错误消息前缀。
+// 参数：error 为统一协议错误。
+// 返回值：客户端可见错误消息。
+private func anthropic_error_message(_ error: GatewayProtocolError) -> String {
+    gateway_client_error_message(error)
 }

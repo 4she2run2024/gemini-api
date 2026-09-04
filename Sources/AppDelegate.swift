@@ -1,6 +1,8 @@
 import AppKit
 import ServiceManagement
 
+// 用途：管理 Gemini2API 菜单栏应用生命周期、菜单和设置窗口。
+// 使用方法：由主程序注册为 NSApplicationDelegate。
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let cfg = Store.shared
@@ -41,16 +43,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(launch)
 
         menu.addItem(.separator())
-        menu.addItem(withTitle: "关于 Gemini Free", action: #selector(showAbout), keyEquivalent: "").target = self
+        menu.addItem(
+            withTitle: "关于 Gemini2API",
+            action: #selector(showAbout),
+            keyEquivalent: "").target = self
         menu.addItem(withTitle: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         statusItem.menu = menu
     }
 
     @objc private func showAbout() {
-        let url = "https://github.com/wp-x/gemini-free"
+        let url = "https://github.com/4she2run2024/gemini-api"
         let credits = NSMutableAttributedString(string: "开源项目\n")
         credits.append(NSAttributedString(string: url, attributes: [.link: URL(string: url)!]))
-        NSApp.orderFrontStandardAboutPanel(options: [.credits: credits, .applicationName: "Gemini Free"])
+        NSApp.orderFrontStandardAboutPanel(options: [
+            .credits: credits,
+            .applicationName: "Gemini2API",
+        ])
         NSApp.activate(ignoringOtherApps: true)
     }
 

@@ -1,5 +1,8 @@
 import Foundation
 
+// 用途：解析本地工具调用 block，并构建既有协议与协议无关网关的工具调用策略。
+// 使用方法：prompt 构建与生成管线调用工具定义、策略转换、解析和校验函数。
+
 enum ToolCallParseError: Error, CustomStringConvertible {
     case malformedBlock
     case missingName
@@ -71,6 +74,52 @@ func toolCallPolicy(_ tools: [Any]?, toolChoice: Any) -> ToolCallPolicy {
         allowedNames: names,
         requiresCall: requiresToolCall(toolChoice) || requiredName != nil,
         requiredName: requiredName)
+}
+
+// 功能：把网关工具定义转换为现有工具提示词使用的字典。
+// 参数：tools 为协议无关工具定义。
+// 返回值：保留名称、说明和 JSON Schema 参数的字典数组。
+func gateway_tool_dictionaries(_ tools: [GatewayTool]) -> [Any] {
+    tools.map { tool in
+        [
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
+        ] as [String: Any]
+    }
+}
+
+// 功能：把协议无关工具选择转换为统一工具调用策略。
+// 参数：request 为已规范化的网关请求。
+// 返回值：包含活动状态、允许名称和调用要求的策略。
+func gateway_tool_policy(_ request: GatewayRequest) -> ToolCallPolicy {
+    let names = Set(request.tools.map(\.name))
+    switch request.tool_choice {
+    case .auto:
+        return ToolCallPolicy(
+            active: !names.isEmpty,
+            allowedNames: names,
+            requiresCall: false,
+            requiredName: nil)
+    case .none:
+        return ToolCallPolicy(
+            active: false,
+            allowedNames: [],
+            requiresCall: false,
+            requiredName: nil)
+    case .required:
+        return ToolCallPolicy(
+            active: !names.isEmpty,
+            allowedNames: names,
+            requiresCall: true,
+            requiredName: nil)
+    case .named(let name):
+        return ToolCallPolicy(
+            active: names.contains(name),
+            allowedNames: names,
+            requiresCall: true,
+            requiredName: name)
+    }
 }
 
 private func requiresToolCall(_ choice: Any) -> Bool {

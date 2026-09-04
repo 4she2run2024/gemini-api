@@ -410,7 +410,8 @@ struct ResponsesProtocolTests {
             "error",
         ])
         precondition(events[2]["code"] as? String == "upstream_error")
-        precondition(events[2]["message"] as? String == "connection lost")
+        precondition(events[2]["message"] as? String == "upstream error")
+        precondition(!jsonString(events[2]).contains("connection lost"))
         precondition(events[2]["param"] is NSNull)
         precondition(events[2]["sequence_number"] as? Int == 2)
     }

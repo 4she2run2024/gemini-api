@@ -45,14 +45,11 @@ extension HTTPServer {
         } catch let error as GatewayProtocolError {
             sendJSON(
                 conn,
-                ["error": [
-                    "message": error.description,
-                    "type": error.code,
-                    "code": error.code,
-                ]],
+                openai_error(error),
                 status: error.http_status)
         } catch {
-            sendJSON(conn, ["error": ["message": "\(error)"]], status: 400)
+            let gateway_error = GatewayProtocolError.upstream("")
+            sendJSON(conn, openai_error(gateway_error), status: 502)
         }
     }
 
@@ -108,7 +105,7 @@ extension HTTPServer {
             sseFinish(conn, encoder.error_event(error))
         } catch {
             guard !gone.on else { return }
-            sseFinish(conn, encoder.error_event(.upstream(String(describing: error))))
+            sseFinish(conn, encoder.error_event(.upstream("")))
         }
     }
 
@@ -405,7 +402,7 @@ struct ResponsesStreamEncoder {
         event([
             "type": "error",
             "code": error.code,
-            "message": error.description,
+            "message": gateway_client_error_message(error),
             "param": NSNull(),
         ])
     }

@@ -122,7 +122,10 @@ final class HTTPServer {
         }
 
         if path.hasPrefix("/v1") && !authorized(headers, path: path) {
-            sendJSON(conn, ["error": ["message": "invalid api key"]], status: 401)
+            sendJSON(
+                conn,
+                authentication_error(path: path),
+                status: 401)
             return
         }
 
@@ -145,7 +148,7 @@ final class HTTPServer {
                 handle_gemini(conn, body: body, route: gemini_route)
                 return
             }
-            sendJSON(conn, ["error": "not found"], status: 404)
+            sendJSON(conn, not_found_error(path: path), status: 404)
         }
     }
 
@@ -156,16 +159,68 @@ final class HTTPServer {
     private func authorized(_ headers: [String: String], path: String) -> Bool {
         let keys = cfg.apiKeys
         if keys.isEmpty { return true }
-        if let auth = headers["authorization"], auth.hasPrefix("Bearer "), keys.contains(String(auth.dropFirst(7))) { return true }
+        if let auth = headers["authorization"],
+           auth.hasPrefix("Bearer "),
+           keys.contains(String(auth.dropFirst(7))) {
+            return true
+        }
         for h in ["x-api-key", "x-goog-api-key"] {
             if let v = headers[h], keys.contains(v) { return true }
         }
-        if let q = path.split(separator: "?", maxSplits: 1).dropFirst().first {
-            for pair in q.split(separator: "&") where pair.hasPrefix("key=") {
-                if keys.contains(String(pair.dropFirst(4))) { return true }
-            }
+        if let query_key = decoded_query_key(path), keys.contains(query_key) {
+            return true
         }
         return false
+    }
+
+    // 功能：按 request path 选择 401 的协议 envelope。
+    // 参数：path 为原始 request target。
+    // 返回值：不回显任何凭据的错误 JSON 对象。
+    private func authentication_error(path: String) -> [String: Any] {
+        switch error_protocol(path) {
+        case .openai:
+            return openai_error(
+                status: 401,
+                message: "invalid api key",
+                code: "invalid_api_key")
+        case .anthropic:
+            return [
+                "type": "error",
+                "error": [
+                    "type": "authentication_error",
+                    "message": "invalid api key",
+                ],
+            ]
+        case .gemini:
+            return gemini_error(status: 401, message: "invalid api key")
+        case .generic:
+            return ["error": ["message": "invalid api key"]]
+        }
+    }
+
+    // 功能：按 request path 选择 404 的协议 envelope。
+    // 参数：path 为原始 request target。
+    // 返回值：OpenAI、Anthropic、Gemini 或通用错误对象。
+    private func not_found_error(path: String) -> [String: Any] {
+        switch error_protocol(path) {
+        case .openai:
+            return openai_error(
+                status: 404,
+                message: "not found",
+                code: "not_found")
+        case .anthropic:
+            return [
+                "type": "error",
+                "error": [
+                    "type": "not_found_error",
+                    "message": "not found",
+                ],
+            ]
+        case .gemini:
+            return gemini_error(status: 404, message: "not found")
+        case .generic:
+            return ["error": "not found"]
+        }
     }
 
     // MARK: 写响应
@@ -214,4 +269,97 @@ final class HTTPServer {
         default: return "OK"
         }
     }
+}
+
+// 功能：把统一协议错误编码为 OpenAI error object。
+// 参数：error 为统一协议错误。
+// 返回值：包含 message、type 和 code 的错误 envelope。
+func openai_error(_ error: GatewayProtocolError) -> [String: Any] {
+    return openai_error(
+        status: error.http_status,
+        message: gateway_client_error_message(error),
+        code: error.code)
+}
+
+// 功能：把统一错误转换为可安全返回客户端的固定消息。
+// 参数：error 为统一协议错误。
+// 返回值：请求错误保留说明；上游和工具协议错误不包含原始内容。
+func gateway_client_error_message(_ error: GatewayProtocolError) -> String {
+    switch error {
+    case .invalid_request, .unsupported:
+        return error.description
+    case .upstream:
+        return "upstream error"
+    case .tool_protocol:
+        return "upstream tool protocol error"
+    }
+}
+
+// 功能：把显式 HTTP 状态和安全消息编码为 OpenAI error object。
+// 参数：status 为 HTTP 状态；message 为安全消息；code 为机器错误码。
+// 返回值：OpenAI 错误 envelope。
+private func openai_error(
+    status: Int,
+    message: String,
+    code: String
+) -> [String: Any] {
+    let type = status == 401 ? "authentication_error" : "invalid_request_error"
+    return [
+        "error": [
+            "message": message,
+            "type": type,
+            "code": code,
+        ],
+    ]
+}
+
+// 功能：从原始 request target 解码第一个 key query 参数。
+// 参数：path 为可能含 query 的 request target。
+// 返回值：正确 percent-decoding 后的 key；缺失或畸形时为 nil。
+private func decoded_query_key(_ path: String) -> String? {
+    let target_parts = path.split(
+        separator: "?",
+        maxSplits: 1,
+        omittingEmptySubsequences: false)
+    guard target_parts.count == 2 else { return nil }
+    for pair in target_parts[1].split(
+        separator: "&",
+        omittingEmptySubsequences: false) {
+        let fields = pair.split(
+            separator: "=",
+            maxSplits: 1,
+            omittingEmptySubsequences: false)
+        guard fields.count == 2,
+              let name = String(fields[0]).removingPercentEncoding,
+              name == "key",
+              let value = String(fields[1]).removingPercentEncoding else {
+            continue
+        }
+        return value
+    }
+    return nil
+}
+
+private enum HTTPErrorProtocol {
+    case openai
+    case anthropic
+    case gemini
+    case generic
+}
+
+// 功能：根据严格 endpoint path 判定错误协议。
+// 参数：path 为原始 request target。
+// 返回值：可确定的协议；未知 endpoint 返回 generic。
+private func error_protocol(_ path: String) -> HTTPErrorProtocol {
+    let endpoint = path.split(separator: "?", maxSplits: 1).first.map(String.init) ?? path
+    if endpoint.hasPrefix("/v1beta/models/") { return .gemini }
+    if endpoint == "/v1/messages" || endpoint == "/v1/messages/count_tokens" {
+        return .anthropic
+    }
+    if endpoint == "/v1/chat/completions"
+        || endpoint == "/v1/responses"
+        || endpoint == "/v1/models" {
+        return .openai
+    }
+    return .generic
 }

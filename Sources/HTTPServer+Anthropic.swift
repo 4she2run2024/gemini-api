@@ -28,7 +28,7 @@ extension HTTPServer {
                 status: error.http_status,
                 message: anthropic_error_message(error))
         } catch {
-            sendAnthropicError(conn, status: 502, message: "upstream error: \(error)")
+            sendAnthropicError(conn, status: 502, message: "upstream error")
         }
     }
 
@@ -49,7 +49,7 @@ extension HTTPServer {
                 status: error.http_status,
                 message: anthropic_error_message(error))
         } catch {
-            sendAnthropicError(conn, status: 400, message: "\(error)")
+            sendAnthropicError(conn, status: 400, message: "invalid request")
         }
     }
 
@@ -125,9 +125,5 @@ extension HTTPServer {
 // 参数：error 为统一协议错误。
 // 返回值：客户端可见错误消息。
 private func anthropic_error_message(_ error: GatewayProtocolError) -> String {
-    switch error {
-    case .tool_protocol: return "upstream tool protocol error: \(error)"
-    case .upstream: return "upstream error: \(error)"
-    case .invalid_request, .unsupported: return error.description
-    }
+    gateway_client_error_message(error)
 }

@@ -36,10 +36,11 @@ extension HTTPServer {
         } catch let error as GatewayProtocolError {
             sendJSON(
                 conn,
-                ["error": ["message": openai_error_message(error)]],
+                openai_error(error),
                 status: error.http_status)
         } catch {
-            sendJSON(conn, ["error": ["message": "\(error)"]], status: 400)
+            let gateway_error = GatewayProtocolError.upstream("")
+            sendJSON(conn, openai_error(gateway_error), status: 502)
         }
     }
 
@@ -65,10 +66,14 @@ extension HTTPServer {
                     finishReason: NSNull())
                 self.sseSend(conn, "data: \(jsonString(chunk))\n\n", gone: gone)
             }
+        } catch let error as GatewayProtocolError {
+            finish_openai_stream_error(conn, error: error)
+            return
         } catch {
-            let delta = ["content": "[upstream error: \(error)]"]
-            let chunk = openAIChunk(context, delta: delta, finishReason: NSNull())
-            sseSend(conn, "data: \(jsonString(chunk))\n\n")
+            finish_openai_stream_error(
+                conn,
+                error: .upstream(""))
+            return
         }
         let end = openAIChunk(context, delta: [:], finishReason: "stop")
         sseSend(conn, "data: \(jsonString(end))\n\n")
@@ -97,11 +102,23 @@ extension HTTPServer {
         } catch let error as GatewayProtocolError {
             sendJSON(
                 conn,
-                ["error": ["message": openai_error_message(error)]],
+                openai_error(error),
                 status: error.http_status)
         } catch {
-            sendJSON(conn, ["error": ["message": "upstream error: \(error)"]], status: 502)
+            let gateway_error = GatewayProtocolError.upstream("")
+            sendJSON(conn, openai_error(gateway_error), status: 502)
         }
+    }
+
+    // 功能：把 OpenAI Chat SSE 错误编码为 error data，并以 DONE 关闭。
+    // 参数：conn 为连接；error 为统一协议错误。
+    // 返回值：无。
+    private func finish_openai_stream_error(
+        _ conn: NWConnection,
+        error: GatewayProtocolError
+    ) {
+        let chunk = "data: \(jsonString(openai_error(error)))\n\n"
+        sseFinish(conn, chunk + "data: [DONE]\n\n")
     }
 
     private func openAIToolCall(_ call: GatewayToolCall) -> [String: Any] {
@@ -335,15 +352,4 @@ private func parse_openai_tool_choice(_ value: Any?) throws -> GatewayToolChoice
         throw GatewayProtocolError.invalid_request("invalid tool_choice")
     }
     return .named(name)
-}
-
-// 功能：为统一错误恢复 OpenAI 既有错误消息前缀。
-// 参数：error 为统一协议错误。
-// 返回值：客户端可见错误消息。
-private func openai_error_message(_ error: GatewayProtocolError) -> String {
-    switch error {
-    case .tool_protocol: return "upstream tool protocol error: \(error)"
-    case .upstream: return "upstream error: \(error)"
-    case .invalid_request, .unsupported: return error.description
-    }
 }

@@ -2,7 +2,7 @@ import Foundation
 import Network
 import CoreFoundation
 
-// 用途：适配 Gemini GenerateContent 路径、请求和非流式响应。
+// 用途：适配 Gemini GenerateContent 路径、请求、响应、SSE 和错误 envelope。
 // 使用方法：HTTPServer 严格解析动态模型路径，再交给共享管线执行。
 
 struct GeminiRoute {
@@ -140,8 +140,37 @@ func make_gemini_response(
     ]
 }
 
+// 功能：把 Gemini response object 编码为单条 SSE data 记录。
+// 参数：response 为可序列化的 GenerateContentResponse。
+// 返回值：以两个换行结尾且不含 DONE 标记的 SSE 记录。
+func gemini_sse_chunk(_ response: [String: Any]) -> String {
+    "data: \(jsonString(response))\n\n"
+}
+
+// 功能：把统一协议错误编码为 Gemini error object。
+// 参数：error 为统一协议错误。
+// 返回值：包含 HTTP code、Google RPC status 和安全消息的 envelope。
+func gemini_error(_ error: GatewayProtocolError) -> [String: Any] {
+    gemini_error(
+        status: error.http_status,
+        message: gateway_client_error_message(error))
+}
+
+// 功能：把 HTTP 状态和安全消息编码为 Gemini error object。
+// 参数：status 为 HTTP 状态；message 为不含凭据和原始 payload 的消息。
+// 返回值：Gemini 错误 envelope。
+func gemini_error(status: Int, message: String) -> [String: Any] {
+    [
+        "error": [
+            "code": status,
+            "message": message,
+            "status": gemini_error_status(status),
+        ],
+    ]
+}
+
 extension HTTPServer {
-    // 功能：解析并执行 Gemini GenerateContent 请求，返回非流式 JSON。
+    // 功能：解析并执行 Gemini GenerateContent 请求，返回 JSON 或 SSE。
     // 参数：conn 为客户端连接；body 为 JSON 请求体；
     // route 为已解析动态路径。
     // 返回值：无。
@@ -152,7 +181,10 @@ extension HTTPServer {
     ) {
         guard let request = (try? JSONSerialization.jsonObject(with: body))
                 as? [String: Any] else {
-            sendJSON(conn, ["error": ["message": "invalid JSON"]], status: 400)
+            sendJSON(
+                conn,
+                gemini_error(status: 400, message: "invalid JSON"),
+                status: 400)
             return
         }
 
@@ -165,23 +197,202 @@ extension HTTPServer {
                 model: route.model,
                 stream: route.stream)
             let context = try pipeline.prepare(gateway_request)
-            let result = try pipeline.generate(context)
             let response_id = "response_" + randomHex(24)
+            if route.stream && !context.tool_policy.active {
+                stream_gemini_text(
+                    conn,
+                    pipeline: pipeline,
+                    context: context,
+                    response_id: response_id)
+                return
+            }
+            let result = try pipeline.generate(context)
+            if route.stream {
+                let response = result.tool_calls.isEmpty
+                    ? make_gemini_response(result, response_id: response_id)
+                    : make_gemini_tool_stream_response(
+                        result,
+                        response_id: response_id)
+                startSSE(conn)
+                sseFinish(conn, gemini_sse_chunk(response))
+                return
+            }
             sendJSON(
                 conn,
                 make_gemini_response(result, response_id: response_id))
         } catch let error as GatewayProtocolError {
             sendJSON(
                 conn,
-                ["error": [
-                    "message": error.description,
-                    "type": error.code,
-                    "code": error.code,
-                ]],
+                gemini_error(error),
                 status: error.http_status)
         } catch {
-            sendJSON(conn, ["error": ["message": "\(error)"]], status: 400)
+            sendJSON(
+                conn,
+                gemini_error(status: 502, message: "upstream error"),
+                status: 502)
         }
+    }
+
+    // 功能：逐 delta 输出 Gemini 文本流，并在最后一个 chunk 附加 usage。
+    // 参数：conn 为连接；pipeline 为共享管线；context 为执行上下文；
+    // response_id 为响应 ID。
+    // 返回值：无。
+    private func stream_gemini_text(
+        _ conn: NWConnection,
+        pipeline: GatewayPipeline,
+        context: GatewayExecutionContext,
+        response_id: String
+    ) {
+        let gone = ClientGone()
+        conn.stateUpdateHandler = { state in
+            if case .failed = state { gone.on = true }
+            if case .cancelled = state { gone.on = true }
+        }
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 1) {
+            _, _, is_complete, error in
+            if is_complete || error != nil { gone.on = true }
+        }
+
+        var pending_delta: String?
+        var full_text = ""
+        startSSE(conn)
+        do {
+            try pipeline.stream_text(
+                context,
+                is_cancelled: { gone.on }
+            ) { delta in
+                guard !gone.on else { return }
+                if let previous_delta = pending_delta {
+                    let response = gemini_stream_text_response(
+                        text: previous_delta,
+                        model: context.model.name,
+                        response_id: response_id)
+                    self.sseSend(
+                        conn,
+                        gemini_sse_chunk(response),
+                        gone: gone)
+                }
+                pending_delta = delta
+                full_text += delta
+            }
+            guard !gone.on else { return }
+            let usage = GatewayUsage(
+                input_tokens: approximateTokenCount(context.generation.prompt),
+                output_tokens: approximateTokenCount(full_text))
+            let response = gemini_stream_text_response(
+                text: pending_delta ?? "",
+                model: context.model.name,
+                response_id: response_id,
+                finish_reason: "STOP",
+                usage: usage)
+            sseFinish(conn, gemini_sse_chunk(response))
+        } catch let error as GatewayProtocolError {
+            guard !gone.on else { return }
+            finish_gemini_stream_error(
+                conn,
+                pending_delta: pending_delta,
+                context: context,
+                response_id: response_id,
+                error: gemini_error(error),
+                gone: gone)
+        } catch {
+            guard !gone.on else { return }
+            finish_gemini_stream_error(
+                conn,
+                pending_delta: pending_delta,
+                context: context,
+                response_id: response_id,
+                error: gemini_error(status: 502, message: "upstream error"),
+                gone: gone)
+        }
+    }
+
+    // 功能：在 Gemini 流错误前写出尚未发送的 delta，再写错误并关闭。
+    // 参数：conn 为连接；pending_delta 为缓存增量；context 和 response_id
+    // 标识响应；error 为错误 envelope；gone 跟踪客户端断开。
+    // 返回值：无。
+    private func finish_gemini_stream_error(
+        _ conn: NWConnection,
+        pending_delta: String?,
+        context: GatewayExecutionContext,
+        response_id: String,
+        error: [String: Any],
+        gone: ClientGone
+    ) {
+        if let pending_delta = pending_delta {
+            let response = gemini_stream_text_response(
+                text: pending_delta,
+                model: context.model.name,
+                response_id: response_id)
+            sseSend(conn, gemini_sse_chunk(response), gone: gone)
+        }
+        guard !gone.on else { return }
+        sseFinish(conn, gemini_sse_chunk(error))
+    }
+}
+
+// 功能：构造仅含完整 functionCall parts 的 Gemini 工具流 response。
+// 参数：result 为至少含一个工具调用的统一结果；response_id 为响应 ID。
+// 返回值：丢弃模型前置文本的 GenerateContentResponse。
+private func make_gemini_tool_stream_response(
+    _ result: GatewayResult,
+    response_id: String
+) -> [String: Any] {
+    let tool_result = GatewayResult(
+        model: result.model,
+        text: "",
+        tool_calls: result.tool_calls,
+        finish_reason: .tool_calls,
+        usage: result.usage)
+    return make_gemini_response(tool_result, response_id: response_id)
+}
+
+// 功能：构造只包含当前 delta 的 Gemini 文本 stream response。
+// 参数：text 为当前 delta；model 和 response_id 标识响应；finish_reason 与 usage
+// 仅用于最后一个 chunk。
+// 返回值：可序列化的 GenerateContentResponse。
+private func gemini_stream_text_response(
+    text: String,
+    model: String,
+    response_id: String,
+    finish_reason: String? = nil,
+    usage: GatewayUsage? = nil
+) -> [String: Any] {
+    var candidate: [String: Any] = [
+        "content": [
+            "role": "model",
+            "parts": [["text": text]],
+        ],
+        "index": 0,
+    ]
+    if let finish_reason = finish_reason {
+        candidate["finishReason"] = finish_reason
+    }
+    var response: [String: Any] = [
+        "candidates": [candidate],
+        "modelVersion": model,
+        "responseId": response_id,
+    ]
+    if let usage = usage {
+        response["usageMetadata"] = [
+            "promptTokenCount": usage.input_tokens,
+            "candidatesTokenCount": usage.output_tokens,
+            "totalTokenCount": usage.total_tokens,
+        ]
+    }
+    return response
+}
+
+// 功能：把 HTTP status 映射为 Gemini/Google RPC status。
+// 参数：status 为 HTTP 状态码。
+// 返回值：对应的大写状态名称。
+private func gemini_error_status(_ status: Int) -> String {
+    switch status {
+    case 400: return "INVALID_ARGUMENT"
+    case 401: return "UNAUTHENTICATED"
+    case 404: return "NOT_FOUND"
+    case 502: return "UNAVAILABLE"
+    default: return "UNKNOWN"
     }
 }
 

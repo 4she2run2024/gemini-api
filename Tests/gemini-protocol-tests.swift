@@ -51,6 +51,7 @@ struct GeminiProtocolTests {
         test_unsupported_features()
         test_text_response()
         test_function_call_response()
+        test_sse_chunk_and_error_envelope()
         try test_http_route_and_unmatched_path()
         print("GeminiProtocolTests passed")
     }
@@ -880,6 +881,36 @@ struct GeminiProtocolTests {
         let arguments = function?["args"] as? [String: Any]
         precondition(arguments?["file_path"] as? String == "README.md")
         precondition(candidate["finishReason"] as? String == "STOP")
+    }
+
+    // 功能：验证 Gemini SSE 只写 JSON data 记录，且 400 使用 Gemini 错误 envelope。
+    // 参数：无。
+    // 返回值：无。
+    private static func test_sse_chunk_and_error_envelope() {
+        let stream = gemini_sse_chunk([
+            "candidates": [[
+                "content": ["role": "model", "parts": [["text": "Hel"]]],
+                "index": 0,
+            ]],
+        ])
+        precondition(stream.hasPrefix("data: "))
+        precondition(stream.hasSuffix("\n\n"))
+        precondition(stream.contains("\"text\":\"Hel\""))
+        precondition(!stream.contains("[DONE]"))
+
+        let envelope = gemini_error(
+            .unsupported("image input is not supported"))
+        let error = envelope["error"] as? [String: Any]
+        precondition(error?["code"] as? Int == 400)
+        precondition(error?["message"] as? String == "image input is not supported")
+        precondition(error?["status"] as? String == "INVALID_ARGUMENT")
+        precondition(error?.count == 3)
+
+        let secret = "Bearer api-key-secret"
+        let openai_envelope = openai_error(.upstream(secret))
+        let gemini_envelope = gemini_error(.upstream(secret))
+        precondition(!jsonString(openai_envelope).contains(secret))
+        precondition(!jsonString(gemini_envelope).contains(secret))
     }
 
     // 功能：验证严格路径命中 handler，额外 segment 继续返回 404。

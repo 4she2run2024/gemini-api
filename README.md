@@ -123,10 +123,11 @@ curl -N "$base_url/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse"
 
 ## OpenAI SDK、Codex、Claude Code、Anthropic SDK、Gemini SDK 示例
 
-以下内容是配置示例。当前版本已经通过本地 fake generator 的 HTTP 验收，
-但尚未完成真实 Gemini 上游和这些官方 SDK 的独立 smoke 验收。因此不要把
-示例视为完整客户端兼容认证。安装客户端依赖时，应使用隔离环境和当前
-稳定版：
+以下内容是配置示例。当前版本已经通过真实 Gemini Web 上游 smoke，
+并在隔离环境中通过 OpenAI Python SDK 3.8.0、Anthropic Python SDK 1.3.0 和
+Google Gen AI Node SDK 2.21.0 的文本、流式与本地 function calling smoke。
+这仍不代表客户端全部能力均受支持；升级 SDK 后应重新执行验收。
+安装客户端依赖时，应使用隔离环境和当前稳定版：
 
 ```bash
 sdk_env_dir="$(mktemp -d)"
@@ -275,7 +276,7 @@ API Key，并由系统防火墙限制来源。不要把 Cookie、API Key 或配�
 - token 数量是近似值，不能作为账单或精确上下文容量依据。
 - 生成控制参数会被接受，但网页上游不保证严格执行。
 - App 使用 ad-hoc 签名且未做 Apple 公证。
-- 官方 SDK 与真实 Gemini 上游 smoke 验收尚未完成。
+- 官方 SDK 或 Gemini Web 协议升级后需要重新运行独立 smoke 验收。
 
 ## 常见问题
 
@@ -327,6 +328,7 @@ GitHub Actions 的 Test step 只调用统一 runner，随后构建 `Gemini2API.a
 - 增加 OpenAI Responses 与 Gemini GenerateContent 两类接口。
 - 以共享生成管线连接七个 endpoint，并补齐鉴权、错误与 SSE 契约。
 - 增加七 endpoint HTTP acceptance 和统一 CI 测试入口。
+- 增加真实 Gemini Web 上游与三个官方 SDK 的可重复 smoke test。
 
 ## 致谢与许可证
 

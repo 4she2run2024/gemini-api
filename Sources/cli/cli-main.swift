@@ -13,22 +13,37 @@ private let CLI_STATUS_ENCODER: JSONEncoder = {
 
 final class CLIApplication {
     private let store: Store
-    private let generator: TextGenerating
+    private let generator_factory: () -> TextGenerating
     private let controller_factory: (Store, TextGenerating) throws -> DaemonController
 
-    // 功能：创建共享公开 parser、runtime 和 daemon controller 的 CLI 应用。
-    // 参数：store 为配置；generator 为生成器；controller_factory 构造
-    // daemon 编排器。
+    // 功能：创建延迟解析 generator 的 CLI 应用。
+    // 参数：store 为配置；generator_factory 在 Store.load 后解析 generator；
+    // controller_factory 构造 daemon 编排器。
     // 返回值：初始化后的 CLIApplication。
     init(
+        store: Store,
+        generator_factory: @escaping () -> TextGenerating,
+        controller_factory: @escaping (Store, TextGenerating) throws
+            -> DaemonController
+    ) {
+        self.store = store
+        self.generator_factory = generator_factory
+        self.controller_factory = controller_factory
+    }
+
+    // 功能：为已有测试和非 production 调用保留具体 generator 便捷入口。
+    // 参数：store、generator 和 controller_factory 与主 initializer 相同。
+    // 返回值：generator 延迟闭包固定返回所给实例的 CLIApplication。
+    convenience init(
         store: Store,
         generator: TextGenerating,
         controller_factory: @escaping (Store, TextGenerating) throws
             -> DaemonController
     ) {
-        self.store = store
-        self.generator = generator
-        self.controller_factory = controller_factory
+        self.init(
+            store: store,
+            generator_factory: { generator },
+            controller_factory: controller_factory)
     }
 
     // 功能：完整解析参数后加载配置，并执行一次公开 CLI 命令。
@@ -52,18 +67,21 @@ final class CLIApplication {
             write_cli_output("Gemini2API \(GEMINI2API_VERSION)")
             return .success
         case .serve(let options):
-            return run_serve(options)
+            return run_serve(options, generator: generator_factory())
         case .status(let json):
-            return run_status(json: json)
+            return run_status(json: json, generator: generator_factory())
         case .stop(let timeout):
-            return run_stop(timeout: timeout)
+            return run_stop(timeout: timeout, generator: generator_factory())
         }
     }
 
     // 功能：应用 runtime overrides，并执行前台或 daemon serve。
-    // 参数：options 为已由公开 parser 校验的 serve 选项。
+    // 参数：options 为已由公开 parser 校验的选项；generator 在 load 后解析。
     // 返回值：ready、usage、conflict 或 runtime 退出码。
-    private func run_serve(_ options: ServeOptions) -> CLIExitCode {
+    private func run_serve(
+        _ options: ServeOptions,
+        generator: TextGenerating
+    ) -> CLIExitCode {
         let runtime = GatewayRuntime(store: store, generator: generator)
         let endpoint: RuntimeEndpoint
         do {
@@ -117,9 +135,12 @@ final class CLIApplication {
     }
 
     // 功能：输出文本或稳定 JSON 状态报告。
-    // 参数：json 指示是否输出机器可读对象。
+    // 参数：json 指示是否输出机器可读对象；generator 在 load 后解析。
     // 返回值：DaemonController 给出的状态退出码。
-    private func run_status(json: Bool) -> CLIExitCode {
+    private func run_status(
+        json: Bool,
+        generator: TextGenerating
+    ) -> CLIExitCode {
         do {
             let controller = try controller_factory(store, generator)
             let (report, exit_code) = controller.status()
@@ -141,9 +162,12 @@ final class CLIApplication {
     }
 
     // 功能：安全请求停止托管 daemon，并按退出码选择 stdout 或 stderr。
-    // 参数：timeout 为身份轮询最长秒数。
+    // 参数：timeout 为身份轮询最长秒数；generator 在 load 后解析。
     // 返回值：DaemonController 给出的停止退出码。
-    private func run_stop(timeout: TimeInterval) -> CLIExitCode {
+    private func run_stop(
+        timeout: TimeInterval,
+        generator: TextGenerating
+    ) -> CLIExitCode {
         do {
             let exit_code = try controller_factory(store, generator).stop(timeout: timeout)
             switch exit_code {
@@ -316,7 +340,7 @@ struct Gemini2APICLI {
 
         let application = CLIApplication(
             store: Store.shared,
-            generator: Engine.shared,
+            generator_factory: { Engine.shared },
             controller_factory: { store, _ in
                 let paths = try RuntimePaths.current_user()
                 return make_cli_daemon_controller(store: store, paths: paths)

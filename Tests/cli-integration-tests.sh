@@ -16,29 +16,170 @@ test_root="$(mktemp -d)"
 helper_source="$test_root/cli-integration-main.swift"
 cli_binary="$test_root/gemini2api-cli-tests"
 pid_file="$test_root/helper-pids.txt"
+pending_pid_file="$test_root/pending-helper-pids.txt"
 touch "$pid_file"
+touch "$pending_pid_file"
+cli_binary_identity=""
 
-# 功能：记录需要在 trap 中精确清理的 helper PID。
+# 功能：通过测试 helper 读取 PID 的 executable path 与启动时间。
 # 参数：首参数为正整数 PID。
-# 返回行为：记录成功返回零，无效 PID 使测试失败。
-record_pid() {
+# 返回行为：stdout 输出 tab 分隔身份；进程不存在或 helper 未就绪时失败。
+inspect_pid_identity() {
   local helper_pid="$1"
-  [[ "$helper_pid" =~ ^[1-9][0-9]*$ ]]
-  echo "$helper_pid" >>"$pid_file"
+  [[ -x "$cli_binary" ]] || return 1
+  GEMINI2API_TEST_ROOT="$test_root" \
+    "$cli_binary" --test-inspect-pid "$helper_pid" 2>/dev/null
 }
 
-# 功能：只向已记录且仍存活的 helper 发送 TERM，并回收测试根。
-# 参数：无；读取 pid_file 和 test_root。
+# 功能：在第一个可失败断言前记录 helper PID 及不可变身份。
+# 参数：首参数为正整数 PID。
+# 返回行为：活进程记录身份；已退出进程无需清理，均返回零。
+record_pid() {
+  local helper_pid="$1"
+  local identity
+  local attempt
+  [[ "$helper_pid" =~ ^[1-9][0-9]*$ ]]
+  printf '%s\n' "$helper_pid" >>"$pending_pid_file"
+  identity=""
+  for attempt in {1..20}; do
+    identity="$(inspect_pid_identity "$helper_pid" || true)"
+    [[ -n "$identity" ]] && break
+    kill -0 "$helper_pid" 2>/dev/null || return 0
+    sleep 0.01
+  done
+  [[ -n "$identity" ]] || return 0
+  printf '%s\t%s\n' "$helper_pid" "$identity" >>"$pid_file"
+}
+
+# 功能：在 trap 中重试登记所有已知 PID 的完整身份。
+# 参数：无；读取 pending_pid_file。
+# 返回行为：已退出 PID 忽略，仍存活且可查询的 PID 写入身份文件。
+register_pending_pids() {
+  local helper_pid
+  local identity
+  local current_path
+  local current_started_at
+  local candidate_command
+  local candidate_program
+  local candidate_identity
+  [[ -f "$pending_pid_file" ]] || return 0
+  [[ -n "$cli_binary_identity" ]] || return 0
+  while IFS= read -r helper_pid; do
+    [[ "$helper_pid" =~ ^[1-9][0-9]*$ ]] || continue
+    identity="$(inspect_pid_identity "$helper_pid" || true)"
+    [[ -n "$identity" ]] || continue
+    IFS=$'\t' read -r current_path current_started_at <<<"$identity"
+    [[ "$current_path" == "$cli_binary_identity" ]] || continue
+    candidate_command="$(ps -p "$helper_pid" -o command= 2>/dev/null || true)"
+    candidate_program="${candidate_command%% *}"
+    candidate_identity="$(python3 - "$candidate_program" <<'PYTHON' 2>/dev/null || true
+import os
+import sys
+print(os.path.realpath(sys.argv[1]))
+PYTHON
+)"
+    [[ "$candidate_identity" == "$cli_binary_identity" ]] || continue
+    case "$candidate_command" in
+      *" --gemini2api-internal-daemon-child "*|*" serve "*) ;;
+      *) continue ;;
+    esac
+    printf '%s\t%s\t%s\n' \
+      "$helper_pid" "$current_path" "$current_started_at" >>"$pid_file"
+  done < <(sort -u "$pending_pid_file")
+}
+
+# 功能：比较 PID 当前身份与登记时的 executable path、启动时间。
+# 参数：PID、期望 executable path、期望启动时间。
+# 返回行为：完整身份一致返回零，消失、复用或查询失败返回一。
+pid_identity_matches() {
+  local helper_pid="$1"
+  local expected_path="$2"
+  local expected_started_at="$3"
+  local current_identity
+  current_identity="$(inspect_pid_identity "$helper_pid" || true)"
+  [[ "$current_identity" == "$expected_path"$'\t'"$expected_started_at" ]]
+}
+
+# 功能：从隔离 state 文件补登记 daemon PID，覆盖 parent 返回后的失败窗口。
+# 参数：无；只读取固定隔离 state 文件。
+# 返回行为：无 state 或无效 JSON 时保持成功。
+register_state_pid() {
+  local state_path="$test_root/support/Gemini2API/runtime/daemon.json"
+  local state_pid
+  [[ -f "$state_path" ]] || return 0
+  state_pid="$(python3 - "$state_path" <<'PYTHON' 2>/dev/null || true
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    print(json.load(handle)["pid"])
+PYTHON
+)"
+  [[ "$state_pid" =~ ^[1-9][0-9]*$ ]] || return 0
+  record_pid "$state_pid"
+}
+
+# 功能：发现并验证唯一测试 binary 的精确 hidden child invocation。
+# 参数：无；使用 canonical cli_binary_identity。
+# 返回行为：只登记 executable 与 command identity 均匹配的 child。
+register_hidden_children() {
+  local candidate_pid
+  local candidate_command
+  local candidate_program
+  local candidate_identity
+  [[ -n "$cli_binary_identity" ]] || return 0
+  while IFS= read -r candidate_pid; do
+    [[ "$candidate_pid" =~ ^[1-9][0-9]*$ ]] || continue
+    candidate_command="$(ps -p "$candidate_pid" -o command= 2>/dev/null || true)"
+    [[ "$candidate_command" == *" --gemini2api-internal-daemon-child "* ]] \
+      || continue
+    candidate_program="${candidate_command%% *}"
+    candidate_identity="$(python3 - "$candidate_program" <<'PYTHON' 2>/dev/null || true
+import os
+import sys
+print(os.path.realpath(sys.argv[1]))
+PYTHON
+)"
+    [[ "$candidate_identity" == "$cli_binary_identity" ]] || continue
+    record_pid "$candidate_pid"
+  done < <(pgrep -f \
+    "$cli_binary_identity --gemini2api-internal-daemon-child" || true)
+}
+
+# 功能：向仍为登记身份的精确 PID 发送 TERM，并有界等待身份消失。
+# 参数：无；读取 pid_file 的 PID、executable path 与启动时间。
+# 返回行为：始终完成全部候选，不使用 SIGKILL。
+terminate_registered_helpers() {
+  local helper_pid
+  local expected_path
+  local expected_started_at
+  local attempt
+  [[ -f "$pid_file" ]] || return 0
+  while IFS=$'\t' read -r helper_pid expected_path expected_started_at; do
+    if pid_identity_matches "$helper_pid" "$expected_path" "$expected_started_at"; then
+      kill -TERM "$helper_pid" 2>/dev/null || true
+    fi
+  done < <(sort -u "$pid_file")
+  while IFS=$'\t' read -r helper_pid expected_path expected_started_at; do
+    for attempt in {1..100}; do
+      pid_identity_matches "$helper_pid" "$expected_path" "$expected_started_at" \
+        || break
+      sleep 0.05
+    done
+  done < <(sort -u "$pid_file")
+}
+
+# 功能：补登记 state/hidden child，两轮终止并有界等待后回收测试根。
+# 参数：无；仅作用于当前 mktemp 根与已验证 PID。
 # 返回行为：不覆盖原测试退出码。
 cleanup() {
-  local helper_pid
-  if [[ -f "$pid_file" ]]; then
-    while IFS= read -r helper_pid; do
-      if [[ "$helper_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$helper_pid" 2>/dev/null; then
-        kill -TERM "$helper_pid" 2>/dev/null || true
-      fi
-    done <"$pid_file"
-  fi
+  register_pending_pids || true
+  register_state_pid || true
+  register_hidden_children || true
+  terminate_registered_helpers || true
+  register_pending_pids || true
+  register_state_pid || true
+  register_hidden_children || true
+  terminate_registered_helpers || true
   if [[ -d "$test_root" ]]; then
     swift -e '
       import Foundation
@@ -60,6 +201,7 @@ import Foundation
 
 private let TEST_ROOT_ENVIRONMENT = "GEMINI2API_TEST_ROOT"
 private let TEST_DAEMON_MODE_ENVIRONMENT = "GEMINI2API_TEST_DAEMON_MODE"
+private let GENERATOR_RESOLUTION_MARKER = "generator-resolution.txt"
 
 private final class CLIFakeGenerator: TextGenerating {
     // 功能：返回固定文本，证明 HTTP request 到达真实 Gateway 管线。
@@ -124,10 +266,16 @@ private func make_test_application(
     child_environment: [String: String] = [:]
 ) -> CLIApplication {
     let (store, paths) = make_test_dependencies(root: root)
-    let generator = CLIFakeGenerator()
     return CLIApplication(
         store: store,
-        generator: generator,
+        generator_factory: {
+            let resolution = store.apiKeys == ["integration-key"]
+                ? "store-loaded"
+                : "store-not-loaded"
+            let marker = root.appendingPathComponent(GENERATOR_RESOLUTION_MARKER)
+            try? Data(resolution.utf8).write(to: marker)
+            return CLIFakeGenerator()
+        },
         controller_factory: { loaded_store, _ in
             make_cli_daemon_controller(
                 store: loaded_store,
@@ -226,6 +374,13 @@ struct CLIIntegrationMain {
         }
         let root = URL(fileURLWithPath: String(cString: root_path), isDirectory: true)
         let arguments = Array(CommandLine.arguments.dropFirst())
+        if arguments.first == "--test-inspect-pid", arguments.count == 2,
+           let pid = Int32(arguments[1]),
+           let identity = try? DarwinProcessInspector().inspect(pid: pid) {
+            write_cli_output(
+                "\(identity.executable_path)\t\(identity.process_started_at)")
+            Darwin.exit(CLIExitCode.success.rawValue)
+        }
         if arguments.first == "--test-publish-state", arguments.count == 4,
            let pid = Int32(arguments[1]), let port = Int(arguments[3]) {
             Darwin.exit(publish_test_state(
@@ -288,6 +443,12 @@ gateway_sources=(
 swiftc -D GEMINI2API_LIBRARY \
   "${gateway_sources[@]}" "$helper_source" \
   -framework Network -framework CryptoKit -o "$cli_binary"
+cli_binary_identity="$(python3 - "$cli_binary" <<'PYTHON'
+import os
+import sys
+print(os.path.realpath(sys.argv[1]))
+PYTHON
+)"
 
 # 功能：生成当前未占用的随机 loopback 端口。
 # 参数：无。
@@ -306,6 +467,16 @@ PYTHON
 # 返回行为：透传 CLI 退出码与输出。
 run_cli() {
   GEMINI2API_TEST_ROOT="$test_root" "$cli_binary" "$@"
+}
+
+# 功能：断言当前公开命令尚未请求 generator factory。
+# 参数：无；读取 generator_marker。
+# 返回行为：被提前解析时输出明确 RED 原因并失败。
+assert_generator_not_resolved() {
+  if [[ -e "$generator_marker" ]]; then
+    echo "generator resolved before Store.load or without runtime command" >&2
+    return 1
+  fi
 }
 
 # 功能：等待根 endpoint 返回 HTTP 200。
@@ -346,11 +517,15 @@ expected_help='gemini2api 0.2.0
   serve [--host HOST] [--port PORT] [--model MODEL] [--daemon]
   status [--json]
   stop [--timeout SECONDS]'
+generator_marker="$test_root/generator-resolution.txt"
+assert_generator_not_resolved
 [[ "$(run_cli --help)" == "$expected_help" ]]
 [[ "$(run_cli --version)" == "Gemini2API 0.2.0" ]]
+! run_cli invalid-command >"$test_root/invalid.out" 2>"$test_root/invalid.err"
 ! run_cli --gemini2api-internal-daemon-child >"$test_root/internal.out" \
   2>"$test_root/internal.err"
 [[ ! "$expected_help" =~ gemini2api-internal-daemon-child ]]
+assert_generator_not_resolved
 
 config_directory="$test_root/config/.config/gemini2api"
 mkdir -p "$config_directory"
@@ -365,6 +540,35 @@ cat >"$config_directory/config.json" <<'JSON'
 JSON
 chmod 600 "$config_directory/config.json"
 
+if [[ ${GEMINI2API_TEST_EARLY_FAILURE:-} == "1" ]]; then
+  early_failure_manifest="${GEMINI2API_TEST_EARLY_FAILURE_MANIFEST:?}"
+  early_failure_port="$(random_port)"
+  printf '%s\t%s\t%s\n' \
+    "$test_root" \
+    "$cli_binary_identity" \
+    "$test_root/support/Gemini2API/runtime/daemon.json" \
+    >"$early_failure_manifest"
+  run_cli serve --host 127.0.0.1 --port "$early_failure_port" --daemon
+  false
+fi
+
+cleanup_probe_manifest="$test_root/cleanup-probe-manifest.txt"
+set +e
+GEMINI2API_TEST_EARLY_FAILURE=1 \
+GEMINI2API_TEST_EARLY_FAILURE_MANIFEST="$cleanup_probe_manifest" \
+  bash Tests/cli-integration-tests.sh --auto \
+  >"$test_root/cleanup-probe.out" 2>"$test_root/cleanup-probe.err"
+cleanup_probe_code=$?
+set -e
+[[ "$cleanup_probe_code" != "0" ]]
+IFS=$'\t' read -r cleanup_probe_root cleanup_probe_binary cleanup_probe_state \
+  <"$cleanup_probe_manifest"
+[[ ! -e "$cleanup_probe_root" ]]
+[[ ! -e "$cleanup_probe_state" ]]
+! pgrep -f \
+  "$cleanup_probe_binary --gemini2api-internal-daemon-child" >/dev/null
+assert_generator_not_resolved
+
 for signal_name in INT TERM; do
   foreground_port="$(random_port)"
   GEMINI2API_TEST_ROOT="$test_root" \
@@ -374,6 +578,7 @@ for signal_name in INT TERM; do
   foreground_pid=$!
   record_pid "$foreground_pid"
   wait_for_http "$foreground_port"
+  [[ "$(<"$generator_marker")" == "store-loaded" ]]
   [[ "$(curl -sS -o /dev/null -w '%{http_code}' \
     "http://127.0.0.1:$foreground_port/")" == "200" ]]
   kill -"$signal_name" "$foreground_pid"
@@ -384,6 +589,7 @@ done
 daemon_port="$(random_port)"
 run_cli serve --host 127.0.0.1 --port "$daemon_port" --daemon
 daemon_pid="$(record_daemon_pid)"
+[[ "$(<"$generator_marker")" == "store-loaded" ]]
 kill -0 "$daemon_pid"
 wait_for_http "$daemon_port"
 [[ "$(run_cli status)" == *"running"* ]]
@@ -524,12 +730,8 @@ GEMINI2API_TEST_DAEMON_MODE=readiness_timeout \
   >"$test_root/readiness.out" 2>"$test_root/readiness.err"
 readiness_code=$?
 set -e
+register_hidden_children
 [[ "$readiness_code" == "5" ]]
-readiness_child_pid="$(pgrep -f \
-  "$cli_binary --gemini2api-internal-daemon-child" | head -1 || true)"
-if [[ -n "$readiness_child_pid" ]]; then
-  record_pid "$readiness_child_pid"
-fi
 sleep 2.5
 [[ ! -e "$state_directory/daemon.json" ]]
 
@@ -540,8 +742,8 @@ wait_for_http "$multithread_port"
 run_cli stop --timeout 3
 ! kill -0 "$multithread_daemon_pid" 2>/dev/null
 
-while IFS= read -r recorded_pid; do
-  ! kill -0 "$recorded_pid" 2>/dev/null
+while IFS=$'\t' read -r recorded_pid recorded_path recorded_started_at; do
+  ! pid_identity_matches "$recorded_pid" "$recorded_path" "$recorded_started_at"
 done <"$pid_file"
 [[ ! -e "$state_directory/daemon.json" ]]
 ! find "$state_directory" -name '*.staging' -print -quit | grep -q .

@@ -1,3 +1,6 @@
+// 用途：定义 Gemini2API 纯 CLI 命令、选项及参数解析契约。
+// 使用方法：传入命令行参数数组调用 parse_cli_command 获取结构化命令。
+
 import Foundation
 
 let GEMINI2API_VERSION = "0.2.0"
@@ -28,15 +31,24 @@ enum CLICommand: Equatable {
 private enum CLIUsageError: Error, CustomStringConvertible {
     case invalid_arguments
 
+    // 功能：返回不泄露用户参数值的 usage 错误描述。
+    // 参数：无。
+    // 返回值：固定的 usage 错误文本。
     var description: String {
         return "usage: invalid arguments"
     }
 }
 
+// 功能：抛出统一的 CLI usage 错误。
+// 参数：无。
+// 返回值：不会正常返回；始终抛出 CLIUsageError。
 private func throw_usage_error() throws -> Never {
     throw CLIUsageError.invalid_arguments
 }
 
+// 功能：依据现有 MODELS 和 think 范围校验模型选项。
+// 参数：value 为待校验的模型标识。
+// 返回值：模型存在且 think 合法时返回 true，否则返回 false。
 private func valid_model(_ value: String) -> Bool {
     let components = value.split(separator: "@", maxSplits: 1,
                                  omittingEmptySubsequences: false)
@@ -57,6 +69,9 @@ private func valid_model(_ value: String) -> Bool {
     return (0...4).contains(think)
 }
 
+// 功能：解析纯 CLI 参数并构造结构化命令。
+// 参数：arguments 为不含程序名的命令行参数数组。
+// 返回值：成功时返回 CLICommand，参数不合法时抛出 usage 错误。
 func parse_cli_command(_ arguments: [String]) throws -> CLICommand {
     guard let command = arguments.first else {
         try throw_usage_error()
@@ -141,6 +156,9 @@ func parse_cli_command(_ arguments: [String]) throws -> CLICommand {
     }
 }
 
+// 功能：生成 CLI 帮助用法文本。
+// 参数：无。
+// 返回值：包含版本和命令选项的 usage 文本。
 func cli_usage() -> String {
     return """
     gemini2api \(GEMINI2API_VERSION)

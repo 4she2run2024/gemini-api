@@ -1,5 +1,11 @@
+// 用途：验证 Gemini2API 纯 CLI 命令解析及 usage 契约。
+// 使用方法：由 bash Tests/run-tests.sh [--auto] 编译并执行。
+
 import Foundation
 
+// 功能：尝试解析参数并将错误转换为 nil，便于断言拒绝行为。
+// 参数：arguments 为不含程序名的命令行参数数组。
+// 返回值：解析成功返回命令，解析失败返回 nil。
 func try_parse(_ arguments: [String]) -> CLICommand? {
     do {
         return try parse_cli_command(arguments)
@@ -8,6 +14,9 @@ func try_parse(_ arguments: [String]) -> CLICommand? {
     }
 }
 
+// 功能：断言给定参数必须产生 usage 错误。
+// 参数：arguments 为不含程序名的非法命令行参数数组。
+// 返回值：无；断言失败时终止测试进程。
 func expect_usage_error(_ arguments: [String]) {
     do {
         _ = try parse_cli_command(arguments)
@@ -19,6 +28,9 @@ func expect_usage_error(_ arguments: [String]) {
 
 @main
 struct CLICommandTests {
+    // 功能：运行 CLI 命令解析契约测试。
+    // 参数：无。
+    // 返回值：无；断言失败时终止测试进程。
     static func main() {
         precondition(try_parse([]) == nil)
         precondition(try_parse(["unknown"]) == nil)

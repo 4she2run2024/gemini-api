@@ -147,18 +147,24 @@ Gateway API Key 等敏感字段没有命令行参数，避免出现在 shell his
 3. 对确认失效的 stale 状态执行废纸篓回收。
 4. 创建父子 readiness pipe。
 5. 动态解析当前 executable path，并以 `posix_spawn` 启动同一 executable；
-   设置 `POSIX_SPAWN_SETSID`，不在多线程 parent 的 fork child 中执行 Swift、
-   Foundation 或 Network。
-6. spawn file actions 把标准流先稳定映射到 `/dev/null`，再把 lock 和 readiness
-   写端从受控高位源 fd 映射到不低于 3 的保留 child fd。
-7. 新进程先解析未公开的内部 child invocation，再重新加载 Store 并重建 generator、
-   runtime、state 和 logger；公开 parser 与帮助均不暴露该 invocation。
+   同时设置 `POSIX_SPAWN_SETSID` 和 `POSIX_SPAWN_CLOEXEC_DEFAULT`，不在多线程
+   parent 的 fork child 中执行 Swift、Foundation 或 Network，也不继承 unrelated fd。
+6. spawn file actions 只显式保留标准流、lock 和 readiness：标准流先稳定映射到
+   `/dev/null`，lock/readiness 写端从受控高位源 fd 映射到不低于 3 的保留
+   child fd。
+7. 新进程先解析未公开的内部 child invocation，再重新加载 Store 并重建
+   generator、runtime、state 和 logger；公开 parser 与帮助均不暴露该 invocation。
 8. exec child 接管 flock、把 stdout/stderr 指向受控日志文件，启动 HTTP 服务并
    等待 listener ready。
 9. child 原子发布 daemon 状态，再通过 pipe 返回 ready；状态 executable path
    必须来自 exec 后的真实进程身份。
 10. parent 在 spawn 成功后只关闭自己的 lock descriptor，不调用 `LOCK_UN`；
     最多等待 10 秒，只有收到 ready 才返回退出码 0。
+
+production child 使用空 `envp`，不得继承 parent 的 HOME、PATH、proxy、token 或
+其他环境项；配置只由 exec 后重新加载的 Store 恢复。测试只能通过 controller
+initializer 注入明确 allowlist 中的非敏感测试模式变量，key/value 不合法时
+fail closed。
 
 `/dev/null` 是操作系统设备路径，不是用户数据路径；其他用户目录和临时
 路径均由系统 API 动态获取。

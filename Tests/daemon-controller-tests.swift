@@ -11,8 +11,8 @@ import Network
 private func test_get_environ()
     -> UnsafeMutablePointer<UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?>
 
-private let TEST_DAEMON_ROOT_ENVIRONMENT = "GEMINI2API_TEST_DAEMON_ROOT"
 private let TEST_DAEMON_MODE_ENVIRONMENT = "GEMINI2API_TEST_DAEMON_MODE"
+private let TEST_PARENT_SECRET_ENVIRONMENT = "GEMINI2API_PARENT_SECRET_TOKEN"
 
 private enum ControllerChildMode: String {
     case normal
@@ -110,7 +110,10 @@ private final class RecordingHealthChecker: HealthChecking {
 }
 
 private enum ControllerTestError: Error {
+    case descriptor_inherited
+    case environment_inherited
     case identity_uncertain
+    case logger_not_redirected
     case socket_failed
 }
 
@@ -232,6 +235,18 @@ struct DaemonControllerTests {
             try run_multithread_regression_helper()
             return
         }
+        if CommandLine.arguments.dropFirst().first == "--fd-inheritance-regression" {
+            try run_fd_inheritance_regression_helper()
+            return
+        }
+        if CommandLine.arguments.dropFirst().first == "--environment-regression" {
+            try run_environment_regression_helper()
+            return
+        }
+        if CommandLine.arguments.dropFirst().first == "--closed-fd-regression" {
+            try run_closed_fd_regression_helper()
+            return
+        }
         if CommandLine.arguments.dropFirst().first == "--port-owner-helper" {
             try run_port_owner_helper()
             return
@@ -273,6 +288,8 @@ struct DaemonControllerTests {
         try test_stop_times_out_without_sigkill(test_root: test_root)
         try test_concurrent_daemon_start_publishes_ready_state(test_root: test_root)
         try test_multithreaded_parent_daemon_lifecycle(test_root: test_root)
+        try test_unrelated_descriptor_is_closed_on_exec(test_root: test_root)
+        try test_parent_secret_environment_is_not_inherited(test_root: test_root)
         try test_stale_state_is_recycled_before_daemon_start(test_root: test_root)
         try test_child_preserves_replaced_state(test_root: test_root)
         try test_port_owner_survives_daemon_conflict(test_root: test_root)
@@ -560,6 +577,140 @@ struct DaemonControllerTests {
         print("MultithreadedParentDaemonRegression passed")
     }
 
+    // 功能：单独运行 unrelated fd inheritance regression，供 RED/GREEN 验证。
+    // 参数：无。
+    // 返回值：通过时输出固定 PASS，并把隔离根移入废纸篓。
+    private static func run_fd_inheritance_regression_helper() throws {
+        let test_root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "gemini2api-fd-inheritance-regression-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: test_root,
+            withIntermediateDirectories: true)
+        defer { recycle_test_root_best_effort(test_root) }
+        try test_unrelated_descriptor_is_closed_on_exec(test_root: test_root)
+        print("FDInheritanceRegression passed")
+    }
+
+    // 功能：单独运行 parent environment regression，供 RED/GREEN 验证。
+    // 参数：无。
+    // 返回值：通过时输出固定 PASS，并把隔离根移入废纸篓。
+    private static func run_environment_regression_helper() throws {
+        let test_root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "gemini2api-environment-regression-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: test_root,
+            withIntermediateDirectories: true)
+        defer { recycle_test_root_best_effort(test_root) }
+        try test_parent_secret_environment_is_not_inherited(test_root: test_root)
+        print("EnvironmentRegression passed")
+    }
+
+    // 功能：单独运行关闭标准 fd regression，定位 stdio/logger 兼容性。
+    // 参数：无。
+    // 返回值：通过时输出固定 PASS，并把隔离根移入废纸篓。
+    private static func run_closed_fd_regression_helper() throws {
+        let test_root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "gemini2api-closed-fd-regression-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: test_root,
+            withIntermediateDirectories: true)
+        defer { recycle_test_root_best_effort(test_root) }
+        try test_closed_standard_descriptors(test_root: test_root)
+        print("ClosedFDRegression passed")
+    }
+
+    // 功能：验证 unrelated 非 CLOEXEC writer 不会被 daemon exec child 继承。
+    // 参数：test_root 为隔离测试总目录。
+    // 返回值：无；parent 关闭 writer 后 reader 未在 daemon 存活时看到 EOF，
+    // 则终止测试。
+    private static func test_unrelated_descriptor_is_closed_on_exec(
+        test_root: URL
+    ) throws {
+        var sentinel_pipe = [Int32](repeating: -1, count: 2)
+        guard Darwin.pipe(&sentinel_pipe) == 0 else {
+            throw ControllerTestError.socket_failed
+        }
+        let sentinel_writer = fcntl(sentinel_pipe[1], F_DUPFD, 80)
+        _ = Darwin.close(sentinel_pipe[1])
+        guard sentinel_writer >= 80 else {
+            _ = Darwin.close(sentinel_pipe[0])
+            throw ControllerTestError.socket_failed
+        }
+        let writer_flags = fcntl(sentinel_writer, F_GETFD)
+        guard writer_flags >= 0,
+              fcntl(
+                  sentinel_writer,
+                  F_SETFD,
+                  writer_flags & ~FD_CLOEXEC) == 0 else {
+            _ = Darwin.close(sentinel_pipe[0])
+            _ = Darwin.close(sentinel_writer)
+            throw ControllerTestError.socket_failed
+        }
+
+        let root = test_root.appendingPathComponent("daemon-unrelated-fd")
+        let fixture = make_daemon_fixture(
+            root: root,
+            port: try available_loopback_port())
+        let exit_code = fixture.controller.serve_daemon(options: ServeOptions(
+            host: nil,
+            port: nil,
+            model: nil,
+            daemon: true))
+        _ = Darwin.close(sentinel_writer)
+        let saw_eof_while_alive = wait_for_pipe_eof(
+            descriptor: sentinel_pipe[0],
+            timeout: 0.5)
+        _ = Darwin.close(sentinel_pipe[0])
+
+        guard let state = try fixture.state_store.load() else {
+            precondition(exit_code == .success)
+            return
+        }
+        var cleanup_pid: Int32? = state.pid
+        defer {
+            if let cleanup_pid { force_cleanup_daemon(pid: cleanup_pid) }
+        }
+        precondition(exit_code == .success)
+        precondition(Darwin.kill(state.pid, 0) == 0)
+        precondition(fixture.controller.stop(timeout: 3) == .success)
+        try wait_for_child_exit(pid: state.pid, timeout: 3)
+        cleanup_pid = nil
+        guard saw_eof_while_alive else {
+            throw ControllerTestError.descriptor_inherited
+        }
+    }
+
+    // 功能：验证 parent 中的 secret environment 不会跨 exec 出现在 daemon child。
+    // 参数：test_root 为隔离测试总目录。
+    // 返回值：无；child 在 readiness 前看到 secret 时会退出并导致断言失败。
+    private static func test_parent_secret_environment_is_not_inherited(
+        test_root: URL
+    ) throws {
+        precondition(setenv(
+            TEST_PARENT_SECRET_ENVIRONMENT,
+            "must-not-cross-exec",
+            1) == 0)
+        defer { unsetenv(TEST_PARENT_SECRET_ENVIRONMENT) }
+
+        let root = test_root.appendingPathComponent("daemon-secret-environment")
+        let fixture = make_daemon_fixture(
+            root: root,
+            port: try available_loopback_port())
+        let exit_code = fixture.controller.serve_daemon(options: ServeOptions(
+            host: nil,
+            port: nil,
+            model: nil,
+            daemon: true))
+        let state = try fixture.state_store.load()
+        if let state {
+            _ = fixture.controller.stop(timeout: 3)
+            try? wait_for_child_exit(pid: state.pid, timeout: 3)
+        }
+        guard exit_code == .success, state != nil else {
+            throw ControllerTestError.environment_inherited
+        }
+    }
+
     // 功能：验证关闭标准 fd 的独立 helper
     // 仍能确定报告 ready、conflict 和 stdin。
     // 参数：test_root 为隔离测试总目录。
@@ -593,6 +744,9 @@ struct DaemonControllerTests {
             }
         }
         let success_output = try read_result_file(success_result)
+        let log_output = try String(
+            contentsOf: fixture.paths.log_path,
+            encoding: .utf8)
         guard success_status == 0,
               success_output == "EXIT 0",
               URLSessionHealthChecker().check(
@@ -600,6 +754,9 @@ struct DaemonControllerTests {
                   port: port,
                   timeout: 2) == .healthy else {
             throw ControllerTestError.socket_failed
+        }
+        guard log_output.contains("event=daemon_ready") else {
+            throw ControllerTestError.logger_not_redirected
         }
         guard fixture.controller.stop(timeout: 3) == .success else {
             throw ControllerTestError.identity_uncertain
@@ -1033,18 +1190,28 @@ struct DaemonControllerTests {
             paths: paths,
             process_inspector: state_process_inspector,
             trash_item: make_fixture_recycler(root: root))
-        var child_environment = ProcessInfo.processInfo.environment
-        child_environment[TEST_DAEMON_ROOT_ENVIRONMENT] = root.path
-        child_environment[TEST_DAEMON_MODE_ENVIRONMENT] = child_mode.rawValue
-        let controller = DaemonController(
-            store: store,
-            state_store: state_store,
-            health_checker: URLSessionHealthChecker(),
-            process_inspector: state_process_inspector,
-            signal_sender: { pid, signal_number in
-                recorder.send(pid: pid, signal_number: signal_number)
-            },
-            spawn_environment: child_environment)
+        let signal_sender: (Int32, Int32) -> Int32 = { pid, signal_number in
+            recorder.send(pid: pid, signal_number: signal_number)
+        }
+        let controller: DaemonController
+        if child_mode == .normal {
+            controller = DaemonController(
+                store: store,
+                state_store: state_store,
+                health_checker: URLSessionHealthChecker(),
+                process_inspector: state_process_inspector,
+                signal_sender: signal_sender)
+        } else {
+            controller = DaemonController(
+                store: store,
+                state_store: state_store,
+                health_checker: URLSessionHealthChecker(),
+                process_inspector: state_process_inspector,
+                signal_sender: signal_sender,
+                child_environment: [
+                    TEST_DAEMON_MODE_ENVIRONMENT: child_mode.rawValue,
+                ])
+        }
         return DaemonFixture(
             controller: controller,
             state_store: state_store,
@@ -1058,6 +1225,27 @@ struct DaemonControllerTests {
     private static func make_runtime_paths(root: URL) -> RuntimePaths {
         RuntimePaths(
             application_support_directory: root.appendingPathComponent("support"),
+            logs_directory: root.appendingPathComponent("logs"))
+    }
+
+    // 功能：从 exec child 已接管的 lock fd 动态还原隔离测试路径。
+    // 参数：lock_descriptor 为保留锁 fd。
+    // 返回值：fd 路径符合测试布局时为 RuntimePaths，否则为 nil。
+    private static func make_runtime_paths(
+        lock_descriptor: Int32
+    ) -> RuntimePaths? {
+        var path_buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        guard fcntl(lock_descriptor, F_GETPATH, &path_buffer) == 0 else {
+            return nil
+        }
+        let lock_path = URL(fileURLWithPath: String(cString: path_buffer))
+        let support_directory = lock_path
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let root = support_directory.deletingLastPathComponent()
+        return RuntimePaths(
+            application_support_directory: support_directory,
             logs_directory: root.appendingPathComponent("logs"))
     }
 
@@ -1175,6 +1363,27 @@ struct DaemonControllerTests {
         var status: Int32 = 0
         while waitpid(pid, &status, 0) < 0 && errno == EINTR {}
         throw ControllerTestError.identity_uncertain
+    }
+
+    // 功能：在固定期限内等待 pipe reader 观察到所有 writer 已关闭
+    // 产生的 EOF。
+    // 参数：descriptor 为 reader；timeout 为最长等待秒数。
+    // 返回值：期限内读取到 EOF 时为 true。
+    private static func wait_for_pipe_eof(
+        descriptor: Int32,
+        timeout: TimeInterval
+    ) -> Bool {
+        let milliseconds = Int32(timeout * 1_000)
+        var item = pollfd(
+            fd: descriptor,
+            events: Int16(POLLIN | POLLHUP),
+            revents: 0)
+        guard Darwin.poll(&item, 1, milliseconds) > 0 else { return false }
+        var byte: UInt8 = 0
+        let count = withUnsafeMutablePointer(to: &byte) { pointer in
+            Darwin.read(descriptor, pointer, 1)
+        }
+        return count == 0
     }
 
     // 功能：失败清理阶段只终止并回收已记录的精确 daemon PID。
@@ -1381,15 +1590,26 @@ struct DaemonControllerTests {
     private static func run_internal_daemon_child(
         _ invocation: DaemonChildInvocation
     ) -> Never {
-        guard let root_path = ProcessInfo.processInfo.environment[
-            TEST_DAEMON_ROOT_ENVIRONMENT],
-              let mode_value = ProcessInfo.processInfo.environment[
-                  TEST_DAEMON_MODE_ENVIRONMENT],
-              let child_mode = ControllerChildMode(rawValue: mode_value) else {
+        guard getenv(TEST_PARENT_SECRET_ENVIRONMENT) == nil else {
+            _exit(71)
+        }
+        guard let paths = make_runtime_paths(
+            lock_descriptor: invocation.lock_descriptor) else {
             _exit(CLIExitCode.usage.rawValue)
         }
-        let root = URL(fileURLWithPath: root_path)
-        let paths = make_runtime_paths(root: root)
+        let environment = ProcessInfo.processInfo.environment
+        let child_mode: ControllerChildMode
+        if let mode_value = environment[TEST_DAEMON_MODE_ENVIRONMENT] {
+            guard let parsed_mode = ControllerChildMode(rawValue: mode_value) else {
+                _exit(CLIExitCode.usage.rawValue)
+            }
+            child_mode = parsed_mode
+        } else {
+            child_mode = .normal
+        }
+        let support_directory = paths.application_directory
+            .deletingLastPathComponent()
+        let root = support_directory.deletingLastPathComponent()
         let process_inspector: ProcessInspecting = child_mode == .late_readiness
             ? DelayedProcessInspector(delay: 11)
             : DarwinProcessInspector()

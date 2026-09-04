@@ -509,7 +509,7 @@ final class DaemonController {
         health_checker: HealthChecking,
         process_inspector: ProcessInspecting,
         signal_sender: @escaping (Int32, Int32) -> Int32,
-        spawn_environment: [String: String]
+        child_environment: [String: String] = [:]
     )
     func serve_daemon(options: ServeOptions) -> CLIExitCode
     func status() -> (StatusReport, CLIExitCode)
@@ -565,6 +565,8 @@ final class DaemonChildRunner {
 - parent 已有额外活动线程时，daemon 仍能 ready、status 和 stop。
 - 关闭标准 fd 的独立 helper 中，lock/readiness fd 仍稳定且启动结果确定。
 - 内部 child invocation 固定使用保留 fd，不被公开 parser 或帮助接受、展示。
+- unrelated 非 CLOEXEC writer 不跨 exec；parent 关闭 writer 后立刻观察到 EOF。
+- parent secret environment 不进入 child；exec 后在 readiness 前验证缺失。
 
 - [ ] **Step 3: 运行测试并确认 RED**
 
@@ -585,9 +587,11 @@ Expected: FAIL，找不到 `DaemonController`。
 - [ ] **Step 5: 实现 daemon start 和安全 stop**
 
 在启动 Network 线程前取得 lock。parent 动态解析当前 executable path，把 lock 和
-readiness 源 fd 复制到受控高位后，用 `posix_spawn` 和 `POSIX_SPAWN_SETSID` 执行
-同一 executable。file actions 把标准流映射到 `/dev/null`，把 lock/readiness 映射到
-保留 child fd；parent 只 close 自己的 flock descriptor，不显式 `LOCK_UN`。
+readiness 源 fd 复制到受控高位后，用 `posix_spawn`、`POSIX_SPAWN_SETSID` 和
+`POSIX_SPAWN_CLOEXEC_DEFAULT` 执行同一 executable。file actions 只显式保留
+`/dev/null` 标准流与映射后的 lock/readiness fd；parent 只 close 自己的 flock
+descriptor，不显式 `LOCK_UN`。production envp 为空，不继承 parent 环境；测试只可
+注入 allowlist 中的非敏感模式变量。
 
 exec 后由隐藏 invocation 进入 `DaemonChildRunner`，重建 Store、generator、runtime、
 state 和 logger。child 只通过 pipe 传固定枚举，不传原始错误；完成 runtime
@@ -687,7 +691,8 @@ production `@main` 只在未定义 `GEMINI2API_LIBRARY` 时编译。它必须在
 `RuntimePaths.current_user()`、logger 和 Darwin process inspector 重建
 `DaemonChildRunner`，并在构造 runtime 前调用 `Store.shared.load()` 恢复非 argv
 配置；非法内部 invocation 返回 usage。普通命令继续进入
-`CLIApplication`。测试开关不得改变 Release binary 的公开命令或路径契约。
+`CLIApplication`。production controller 使用空 child environment；测试开关不得
+改变 Release binary 的公开命令或路径契约。
 
 - [ ] **Step 4: 验证端到端 GREEN**
 

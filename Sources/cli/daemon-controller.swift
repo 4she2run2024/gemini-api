@@ -13,6 +13,9 @@ private let DAEMON_REAP_TIMEOUT_SECONDS: TimeInterval = 0.25
 private let DAEMON_LOCK_DESCRIPTOR: Int32 = 3
 private let DAEMON_READINESS_DESCRIPTOR: Int32 = 4
 private let SPAWN_SOURCE_DESCRIPTOR_MINIMUM: Int32 = 64
+private let ALLOWED_CHILD_ENVIRONMENT_KEYS = Set([
+    "GEMINI2API_TEST_DAEMON_MODE",
+])
 
 enum DaemonChildInvocationParseResult: Equatable {
     case not_internal
@@ -280,7 +283,7 @@ final class DaemonController {
     private let health_checker: HealthChecking
     private let process_inspector: ProcessInspecting
     private let signal_sender: (Int32, Int32) -> Int32
-    private let spawn_environment: [String: String]
+    private let child_environment: [String: String]
 
     // 功能：创建可测试的 daemon 生命周期编排器。
     // 参数：store 为已加载配置；其余参数为状态、健康、进程、信号和
@@ -292,14 +295,14 @@ final class DaemonController {
         health_checker: HealthChecking,
         process_inspector: ProcessInspecting,
         signal_sender: @escaping (Int32, Int32) -> Int32,
-        spawn_environment: [String: String] = ProcessInfo.processInfo.environment
+        child_environment: [String: String] = [:]
     ) {
         self.store = store
         self.state_store = state_store
         self.health_checker = health_checker
         self.process_inspector = process_inspector
         self.signal_sender = signal_sender
-        self.spawn_environment = spawn_environment
+        self.child_environment = child_environment
     }
 
     // 功能：持锁解析当前状态，再 posix_spawn 同一 executable，
@@ -350,7 +353,7 @@ final class DaemonController {
                   invocation: invocation,
                   readiness_source: pipe_descriptors[1],
                   daemon_lock: daemon_lock,
-                  environment: spawn_environment) else {
+                  environment: child_environment) else {
             _ = Darwin.close(pipe_descriptors[0])
             _ = Darwin.close(pipe_descriptors[1])
             return .runtime
@@ -768,14 +771,15 @@ private func spawn_daemon_child(
     defer { posix_spawnattr_destroy(&attributes) }
     guard posix_spawnattr_setflags(
         &attributes,
-        Int16(POSIX_SPAWN_SETSID)) == 0 else {
+        Int16(POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT)) == 0 else {
         return nil
     }
 
     let arguments = [executable_path] + invocation.command_arguments
     let environment_entries = environment.keys.sorted().compactMap { key -> String? in
-        guard !key.isEmpty, !key.contains("="), !key.utf8.contains(0),
-              let value = environment[key], !value.utf8.contains(0) else {
+        guard ALLOWED_CHILD_ENVIRONMENT_KEYS.contains(key),
+              let value = environment[key],
+              valid_child_environment_value(value) else {
             return nil
         }
         return "\(key)=\(value)"
@@ -790,6 +794,16 @@ private func spawn_daemon_child(
         environment: environment_entries,
         file_actions: &file_actions,
         attributes: &attributes)
+}
+
+// 功能：验证显式 child 测试环境值，拒绝空值、控制字符和过大元数据。
+// 参数：value 为非敏感测试模式名。
+// 返回值：可作为受控 envp value 时为 true。
+private func valid_child_environment_value(_ value: String) -> Bool {
+    !value.isEmpty && value.utf8.count <= 128
+        && !value.unicodeScalars.contains(where: {
+            $0.value < 0x20 || $0.value == 0x7F
+        })
 }
 
 // 功能：为 exec child 预先把三个标准流稳定映射到 /dev/null。

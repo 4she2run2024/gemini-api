@@ -33,10 +33,18 @@ final class Engine: TextGenerating {
     static let shared = Engine()
     private let cfg = Store.shared
 
-    func log(_ msg: String) {
+    // 功能：记录不含原始错误描述的 retry 类别日志。
+    // 参数：attempt 为当前次数；total 为总次数；error 仅用于提取类型。
+    // 返回值：无。
+    func log_retry(attempt: Int, total: Int, error: Error) {
         guard cfg.logRequests else { return }
-        let ts = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
-        FileHandle.standardError.write("[\(ts)] \(msg)\n".data(using: .utf8)!)
+        let ts = DateFormatter.localizedString(
+            from: Date(),
+            dateStyle: .none,
+            timeStyle: .medium)
+        let error_type = String(describing: type(of: error))
+        let message = "[\(ts)] retry=\(attempt)/\(total) error_type=\(error_type)\n"
+        FileHandle.standardError.write(Data(message.utf8))
     }
 
     // MARK: Cookie
@@ -187,7 +195,10 @@ final class Engine: TextGenerating {
                 if case EngineError.http(let c) = error, c < 500 { throw error }
                 lastErr = error
                 if attempt < cfg.retryAttempts - 1 {
-                    log("Retry \(attempt + 1)/\(cfg.retryAttempts): \(error)")
+                    log_retry(
+                        attempt: attempt + 1,
+                        total: cfg.retryAttempts,
+                        error: error)
                     Thread.sleep(forTimeInterval: cfg.retryDelaySec)
                 }
             }

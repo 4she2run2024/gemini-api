@@ -111,6 +111,12 @@ run_test runtime-state-tests \
   Sources/cli/runtime-state.swift \
   Tests/runtime-state-tests.swift
 
+run_test daemon-logger-tests \
+  "${GATEWAY_SOURCES[@]}" \
+  Sources/cli/daemon-logger.swift \
+  Tests/daemon-logger-tests.swift \
+  -framework CryptoKit
+
 run_test gateway-runtime-tests \
   "${GATEWAY_SOURCES[@]}" \
   Sources/HTTPServer.swift \

@@ -105,17 +105,38 @@ pid_identity_matches() {
 # 返回行为：无 state 或无效 JSON 时保持成功。
 register_state_pid() {
   local state_path="$test_root/support/Gemini2API/runtime/daemon.json"
+  local state_identity
   local state_pid
+  local state_executable_path
+  local state_started_at
   [[ -f "$state_path" ]] || return 0
-  state_pid="$(python3 - "$state_path" <<'PYTHON' 2>/dev/null || true
+  state_identity="$(python3 - "$state_path" <<'PYTHON' 2>/dev/null || true
 import json
 import sys
 with open(sys.argv[1], encoding="utf-8") as handle:
-    print(json.load(handle)["pid"])
+    state = json.load(handle)
+pid = state.get("pid")
+executable_path = state.get("executable_path")
+started_at = state.get("process_started_at")
+if (
+    type(pid) is not int
+    or pid <= 0
+    or not isinstance(executable_path, str)
+    or not executable_path
+    or type(started_at) is not int
+    or started_at <= 0
+):
+    raise SystemExit(1)
+print(f"{pid}\t{executable_path}\t{started_at}")
 PYTHON
 )"
-  [[ "$state_pid" =~ ^[1-9][0-9]*$ ]] || return 0
-  record_pid "$state_pid"
+  [[ -n "$state_identity" ]] || return 0
+  IFS=$'\t' read -r \
+    state_pid state_executable_path state_started_at <<<"$state_identity"
+  pid_identity_matches \
+    "$state_pid" "$state_executable_path" "$state_started_at" || return 0
+  printf '%s\t%s\t%s\n' \
+    "$state_pid" "$state_executable_path" "$state_started_at" >>"$pid_file"
 }
 
 # 功能：发现并验证唯一测试 binary 的精确 hidden child invocation。
@@ -125,22 +146,34 @@ register_hidden_children() {
   local candidate_pid
   local candidate_command
   local candidate_program
-  local candidate_identity
+  local candidate_program_identity
+  local identity_before
+  local identity_after
+  local current_path
+  local current_started_at
   [[ -n "$cli_binary_identity" ]] || return 0
   while IFS= read -r candidate_pid; do
     [[ "$candidate_pid" =~ ^[1-9][0-9]*$ ]] || continue
+    identity_before="$(inspect_pid_identity "$candidate_pid" || true)"
+    [[ -n "$identity_before" ]] || continue
+    IFS=$'\t' read -r current_path current_started_at <<<"$identity_before"
+    [[ "$current_path" == "$cli_binary_identity" ]] || continue
     candidate_command="$(ps -p "$candidate_pid" -o command= 2>/dev/null || true)"
     [[ "$candidate_command" == *" --gemini2api-internal-daemon-child "* ]] \
       || continue
     candidate_program="${candidate_command%% *}"
-    candidate_identity="$(python3 - "$candidate_program" <<'PYTHON' 2>/dev/null || true
+    candidate_program_identity="$(
+      python3 - "$candidate_program" <<'PYTHON' 2>/dev/null || true
 import os
 import sys
 print(os.path.realpath(sys.argv[1]))
 PYTHON
 )"
-    [[ "$candidate_identity" == "$cli_binary_identity" ]] || continue
-    record_pid "$candidate_pid"
+    [[ "$candidate_program_identity" == "$cli_binary_identity" ]] || continue
+    identity_after="$(inspect_pid_identity "$candidate_pid" || true)"
+    [[ "$identity_after" == "$identity_before" ]] || continue
+    printf '%s\t%s\t%s\n' \
+      "$candidate_pid" "$current_path" "$current_started_at" >>"$pid_file"
   done < <(pgrep -f \
     "$cli_binary_identity --gemini2api-internal-daemon-child" || true)
 }
@@ -540,6 +573,37 @@ cat >"$config_directory/config.json" <<'JSON'
 JSON
 chmod 600 "$config_directory/config.json"
 
+if [[ -n ${GEMINI2API_TEST_STATE_CLEANUP_MODE:-} ]]; then
+  state_cleanup_mode="$GEMINI2API_TEST_STATE_CLEANUP_MODE"
+  state_cleanup_pid="${GEMINI2API_TEST_STATE_CLEANUP_PID:?}"
+  state_cleanup_path="${GEMINI2API_TEST_STATE_CLEANUP_PATH:?}"
+  state_cleanup_started_at="${GEMINI2API_TEST_STATE_CLEANUP_STARTED_AT:?}"
+  state_cleanup_file="$test_root/support/Gemini2API/runtime/daemon.json"
+  mkdir -p "$(dirname "$state_cleanup_file")"
+  python3 - \
+    "$state_cleanup_mode" \
+    "$state_cleanup_pid" \
+    "$state_cleanup_path" \
+    "$state_cleanup_started_at" \
+    "$state_cleanup_file" <<'PYTHON'
+import json
+import sys
+
+mode, pid, executable_path, started_at, output_path = sys.argv[1:]
+state_pid = 2147483647 if mode == "stale" else int(pid)
+state_path = executable_path + ".forged" if mode == "forged" else executable_path
+state_started_at = int(started_at) + 1 if mode == "reused" else int(started_at)
+with open(output_path, "w", encoding="utf-8") as handle:
+    json.dump({
+        "pid": state_pid,
+        "executable_path": state_path,
+        "process_started_at": state_started_at,
+    }, handle)
+PYTHON
+  chmod 600 "$state_cleanup_file"
+  false
+fi
+
 if [[ ${GEMINI2API_TEST_EARLY_FAILURE:-} == "1" ]]; then
   early_failure_manifest="${GEMINI2API_TEST_EARLY_FAILURE_MANIFEST:?}"
   early_failure_port="$(random_port)"
@@ -551,6 +615,68 @@ if [[ ${GEMINI2API_TEST_EARLY_FAILURE:-} == "1" ]]; then
   run_cli serve --host 127.0.0.1 --port "$early_failure_port" --daemon
   false
 fi
+
+# 功能：证明 trap 不会信任 stale、复用或伪造 state 中的裸 PID。
+# 参数：首参数为 state 情形：stale、reused 或 forged。
+# 返回行为：嵌套失败清理未向无关 owner 发送 TERM 时成功。
+run_state_cleanup_identity_probe() {
+  local cleanup_mode="$1"
+  local term_marker="$test_root/state-cleanup-$cleanup_mode-term.txt"
+  local ready_marker="$test_root/state-cleanup-$cleanup_mode-ready.txt"
+  local sentinel_pid
+  local sentinel_identity
+  local sentinel_path
+  local sentinel_started_at
+  local probe_code
+  python3 - "$term_marker" "$ready_marker" <<'PYTHON' &
+import pathlib
+import signal
+import sys
+import time
+
+term_path = pathlib.Path(sys.argv[1])
+ready_path = pathlib.Path(sys.argv[2])
+
+def handle_term(_signal_number, _frame):
+    term_path.write_text("TERM\n", encoding="utf-8")
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, handle_term)
+ready_path.write_text("ready\n", encoding="utf-8")
+while True:
+    time.sleep(1)
+PYTHON
+  sentinel_pid=$!
+  record_pid "$sentinel_pid"
+  for _ in {1..100}; do
+    [[ -e "$ready_marker" ]] && break
+    sleep 0.01
+  done
+  [[ -e "$ready_marker" ]]
+  sentinel_identity="$(inspect_pid_identity "$sentinel_pid")"
+  IFS=$'\t' read -r sentinel_path sentinel_started_at <<<"$sentinel_identity"
+  set +e
+  GEMINI2API_TEST_STATE_CLEANUP_MODE="$cleanup_mode" \
+  GEMINI2API_TEST_STATE_CLEANUP_PID="$sentinel_pid" \
+  GEMINI2API_TEST_STATE_CLEANUP_PATH="$sentinel_path" \
+  GEMINI2API_TEST_STATE_CLEANUP_STARTED_AT="$sentinel_started_at" \
+    bash Tests/cli-integration-tests.sh --auto \
+    >"$test_root/state-cleanup-$cleanup_mode.out" \
+    2>"$test_root/state-cleanup-$cleanup_mode.err"
+  probe_code=$?
+  set -e
+  [[ "$probe_code" != "0" ]]
+  if [[ -e "$term_marker" ]] || ! kill -0 "$sentinel_pid" 2>/dev/null; then
+    echo "cleanup trusted $cleanup_mode state without saved identity" >&2
+    return 1
+  fi
+  kill -TERM "$sentinel_pid"
+  wait "$sentinel_pid"
+}
+
+for state_cleanup_case in forged reused stale; do
+  run_state_cleanup_identity_probe "$state_cleanup_case"
+done
 
 cleanup_probe_manifest="$test_root/cleanup-probe-manifest.txt"
 set +e

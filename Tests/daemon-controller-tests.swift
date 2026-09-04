@@ -271,6 +271,11 @@ struct DaemonControllerTests {
             try run_late_ready_helper()
             return
         }
+        if CommandLine.arguments.dropFirst().first
+            == "--readiness-timeout-regression" {
+            try run_readiness_timeout_regression_helper()
+            return
+        }
         if CommandLine.arguments.dropFirst().first == "--closed-fd-serve-helper" {
             try run_closed_fd_serve_helper()
             return
@@ -1185,12 +1190,34 @@ struct DaemonControllerTests {
         precondition(Date().timeIntervalSince(started_at) < 10.8)
         let records = signal_recorder.records()
         precondition(records.count == 1)
+        let child_pid = records[0].pid
+        var child_exited = false
+        defer {
+            if !child_exited { force_cleanup_daemon(pid: child_pid) }
+        }
         precondition(records[0].signal_number == SIGTERM)
-        precondition(records[0].pid != getpid())
+        precondition(child_pid != getpid())
         precondition(!records.contains(where: { $0.signal_number == SIGKILL }))
-        try wait_for_child_exit(pid: records[0].pid, timeout: 3)
+        // TSan child 初始化会占用 parent 的 10 秒 readiness 窗口，
+        // 额外 8 秒仍有明确上限，并覆盖 child 自然完成 12 秒 sleep 的余量。
+        try wait_for_child_exit(pid: child_pid, timeout: 8)
+        child_exited = true
         let state = try fixture.state_store.load()
         precondition(state == nil)
+    }
+
+    // 功能：单独运行 readiness timeout 回收回归，供 TSan 重复验证。
+    // 参数：无。
+    // 返回值：通过时输出固定 PASS，并把隔离根移入废纸篓。
+    private static func run_readiness_timeout_regression_helper() throws {
+        let test_root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "gemini2api-readiness-timeout-regression-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: test_root,
+            withIntermediateDirectories: true)
+        defer { recycle_test_root_best_effort(test_root) }
+        try test_readiness_timeout_cleans_child(test_root: test_root)
+        print("ReadinessTimeoutRegression passed")
     }
 
     // 功能：验证 parent 超时关闭 pipe 后，

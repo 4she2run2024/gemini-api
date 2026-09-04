@@ -7,8 +7,19 @@ import Dispatch
 import Foundation
 import Network
 
-@_silgen_name("fork")
-private func test_system_fork() -> pid_t
+@_silgen_name("_NSGetEnviron")
+private func test_get_environ()
+    -> UnsafeMutablePointer<UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?>
+
+private let TEST_DAEMON_ROOT_ENVIRONMENT = "GEMINI2API_TEST_DAEMON_ROOT"
+private let TEST_DAEMON_MODE_ENVIRONMENT = "GEMINI2API_TEST_DAEMON_MODE"
+
+private enum ControllerChildMode: String {
+    case normal
+    case early_exit
+    case readiness_timeout
+    case late_readiness
+}
 
 private final class ControllerFakeGenerator: TextGenerating {
     // 功能：返回固定文本，避免 controller 测试访问真实上游。
@@ -209,6 +220,18 @@ struct DaemonControllerTests {
     // 参数：无。
     // 返回值：全部断言通过时正常退出，否则终止测试进程。
     static func main() throws {
+        switch DaemonChildInvocation.parse(arguments: CommandLine.arguments) {
+        case .invocation(let invocation):
+            run_internal_daemon_child(invocation)
+        case .invalid:
+            _exit(CLIExitCode.usage.rawValue)
+        case .not_internal:
+            break
+        }
+        if CommandLine.arguments.dropFirst().first == "--multithread-regression" {
+            try run_multithread_regression_helper()
+            return
+        }
         if CommandLine.arguments.dropFirst().first == "--port-owner-helper" {
             try run_port_owner_helper()
             return
@@ -229,10 +252,6 @@ struct DaemonControllerTests {
             try run_closed_fd_serve_helper()
             return
         }
-        if CommandLine.arguments.dropFirst().first == "--stdin-null-helper" {
-            try run_stdin_null_helper()
-            return
-        }
         let test_root = FileManager.default.temporaryDirectory
             .appendingPathComponent("gemini2api-controller-tests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(
@@ -246,12 +265,14 @@ struct DaemonControllerTests {
         try test_status_json_keeps_null_fields()
         try test_url_session_health_checker()
         test_listener_error_classification()
+        test_internal_child_invocation_parser()
         try test_closed_standard_descriptors(test_root: test_root)
         try test_stop_rejects_untrusted_identity(test_root: test_root)
         try test_stop_sends_one_sigterm_and_accepts_exit(test_root: test_root)
         try test_stop_accepts_pid_reuse(test_root: test_root)
         try test_stop_times_out_without_sigkill(test_root: test_root)
         try test_concurrent_daemon_start_publishes_ready_state(test_root: test_root)
+        try test_multithreaded_parent_daemon_lifecycle(test_root: test_root)
         try test_stale_state_is_recycled_before_daemon_start(test_root: test_root)
         try test_child_preserves_replaced_state(test_root: test_root)
         try test_port_owner_survives_daemon_conflict(test_root: test_root)
@@ -448,21 +469,102 @@ struct DaemonControllerTests {
             POSIXError(.EACCES)) == .runtime)
     }
 
+    // 功能：验证隐藏 child invocation 只接受固定字段和保留 fd。
+    // 参数：无。
+    // 返回值：无；公开参数、fd 或 endpoint 边界被放宽时终止测试。
+    private static func test_internal_child_invocation_parser() {
+        let invocation = DaemonChildInvocation(
+            readiness_descriptor: 4,
+            lock_descriptor: 3,
+            host: "127.0.0.1",
+            port: 18_080,
+            model: "gemini-3.8-flash")
+        precondition(DaemonChildInvocation.parse(arguments: [
+            "gemini2api",
+        ] + invocation.command_arguments) == .invocation(invocation))
+        precondition(DaemonChildInvocation.parse(arguments: [
+            "gemini2api", "status",
+        ]) == .not_internal)
+        precondition(DaemonChildInvocation.parse(arguments: [
+            "gemini2api", DaemonChildInvocation.marker, "2", "3",
+            "127.0.0.1", "18080", "gemini-3.8-flash",
+        ]) == .invalid)
+        precondition(DaemonChildInvocation.parse(arguments: [
+            "gemini2api", DaemonChildInvocation.marker, "4", "4",
+            "127.0.0.1", "18080", "gemini-3.8-flash",
+        ]) == .invalid)
+        precondition(DaemonChildInvocation.parse(arguments: [
+            "gemini2api", DaemonChildInvocation.marker, "4", "3",
+            "127.0.0.1", "0", "gemini-3.8-flash",
+        ]) == .invalid)
+    }
+
+    // 功能：验证 parent 已有额外活动线程时仍可经 exec 边界
+    // 启动、探测和停止 daemon。
+    // 参数：test_root 为隔离测试总目录。
+    // 返回值：无；spawn 退化为不安全 fork 或生命周期不完整时
+    // 终止测试。
+    private static func test_multithreaded_parent_daemon_lifecycle(
+        test_root: URL
+    ) throws {
+        let thread_started = DispatchSemaphore(value: 0)
+        let thread_release = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            thread_started.signal()
+            thread_release.wait()
+        }
+        precondition(thread_started.wait(timeout: .now() + 2) == .success)
+        defer { thread_release.signal() }
+
+        let root = test_root.appendingPathComponent("daemon-multithreaded-parent")
+        let port = try available_loopback_port()
+        let fixture = make_daemon_fixture(root: root, port: port)
+        precondition(fixture.controller.serve_daemon(options: ServeOptions(
+            host: "127.0.0.1",
+            port: port,
+            model: "gemini-3.8-flash",
+            daemon: true)) == .success)
+        guard let state = try fixture.state_store.load() else {
+            throw ControllerTestError.identity_uncertain
+        }
+        guard let parent_identity = try DarwinProcessInspector().inspect(pid: getpid()) else {
+            throw ControllerTestError.identity_uncertain
+        }
+        precondition(state.executable_path == parent_identity.executable_path)
+        precondition(getsid(state.pid) == state.pid)
+        var cleanup_pid: Int32? = state.pid
+        defer {
+            if let cleanup_pid { force_cleanup_daemon(pid: cleanup_pid) }
+        }
+        let (report, status_code) = fixture.controller.status()
+        precondition(status_code == .success)
+        precondition(report.state == .running)
+        precondition(report.managed)
+        precondition(report.healthy == true)
+        precondition(fixture.controller.stop(timeout: 3) == .success)
+        try wait_for_child_exit(pid: state.pid, timeout: 3)
+        cleanup_pid = nil
+    }
+
+    // 功能：单独运行多线程 parent daemon regression，供 focused 重复验证。
+    // 参数：无。
+    // 返回值：通过时输出固定 PASS，并把隔离根移入废纸篓。
+    private static func run_multithread_regression_helper() throws {
+        let test_root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "gemini2api-multithread-regression-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: test_root,
+            withIntermediateDirectories: true)
+        defer { recycle_test_root_best_effort(test_root) }
+        try test_multithreaded_parent_daemon_lifecycle(test_root: test_root)
+        print("MultithreadedParentDaemonRegression passed")
+    }
+
     // 功能：验证关闭标准 fd 的独立 helper
     // 仍能确定报告 ready、conflict 和 stdin。
     // 参数：test_root 为隔离测试总目录。
     // 返回值：无；pipe/lock fd 丢失、stdin 被误关或错误分类时终止测试。
     private static func test_closed_standard_descriptors(test_root: URL) throws {
-        let stdin_result = test_root.appendingPathComponent("stdin-null-result")
-        let stdin_pid = try spawn_exec_helper(
-            arguments: ["--stdin-null-helper", stdin_result.path],
-            close_stdin: true,
-            close_output: false)
-        let stdin_status = try wait_for_child_status(pid: stdin_pid, timeout: 3)
-        let stdin_output = try read_result_file(stdin_result)
-        precondition(stdin_status == 0)
-        precondition(stdin_output == "RESULT 1 OPEN 1")
-
         let success_root = test_root.appendingPathComponent("closed-fd-success")
         try FileManager.default.createDirectory(
             at: success_root,
@@ -762,7 +864,7 @@ struct DaemonControllerTests {
         let fixture = make_daemon_fixture(
             root: root,
             port: try available_loopback_port(),
-            logger_factory: { _exit(27) })
+            child_mode: .early_exit)
         precondition(fixture.controller.serve_daemon(options: ServeOptions(
             host: nil,
             port: nil,
@@ -778,7 +880,6 @@ struct DaemonControllerTests {
     // 未自然退出时终止测试。
     private static func test_readiness_timeout_cleans_child(test_root: URL) throws {
         let root = test_root.appendingPathComponent("daemon-timeout")
-        let paths = make_runtime_paths(root: root)
         let signal_recorder = SignalRecorder { pid, signal_number in
             _ = Darwin.kill(pid, signal_number)
             errno = EPERM
@@ -788,13 +889,7 @@ struct DaemonControllerTests {
             root: root,
             port: try available_loopback_port(),
             signal_recorder: signal_recorder,
-            logger_factory: {
-                _ = Darwin.signal(SIGTERM, SIG_IGN)
-                Thread.sleep(forTimeInterval: 12)
-                return DaemonLogger(
-                    log_url: paths.log_path,
-                    trash_item: make_fixture_recycler(root: root))
-            })
+            child_mode: .readiness_timeout)
         let started_at = Date()
         precondition(fixture.controller.serve_daemon(options: ServeOptions(
             host: nil,
@@ -862,16 +957,7 @@ struct DaemonControllerTests {
             trash_item: make_fixture_recycler(root: root))
         let controller = DaemonController(
             store: store,
-            generator: ControllerFakeGenerator(),
-            runtime_factory: { store, generator in
-                GatewayRuntime(store: store, generator: generator)
-            },
             state_store: state_store,
-            logger_factory: {
-                DaemonLogger(
-                    log_url: paths.log_path,
-                    trash_item: make_fixture_recycler(root: root))
-            },
             health_checker: health_checker,
             process_inspector: process_inspector,
             signal_sender: { pid, signal_number in Darwin.kill(pid, signal_number) })
@@ -919,16 +1005,7 @@ struct DaemonControllerTests {
         try state_store.publish(state)
         let controller = DaemonController(
             store: store,
-            generator: ControllerFakeGenerator(),
-            runtime_factory: { store, generator in
-                GatewayRuntime(store: store, generator: generator)
-            },
             state_store: state_store,
-            logger_factory: {
-                DaemonLogger(
-                    log_url: paths.log_path,
-                    trash_item: make_fixture_recycler(root: root))
-            },
             health_checker: RecordingHealthChecker(result: .unreachable),
             process_inspector: process_inspector,
             signal_sender: { pid, signal_number in
@@ -938,19 +1015,16 @@ struct DaemonControllerTests {
     }
 
     // 功能：创建使用真实 runtime、进程查询和隔离文件树的 daemon 夹具。
-    // 参数：root、port 为场景路径和端口；可覆盖 signal 与 logger 边界。
+    // 参数：root、port 为场景路径和端口；可覆盖 signal 与 child 测试模式。
     // 返回值：controller、状态存储、路径和 recorder。
     private static func make_daemon_fixture(
         root: URL,
         port: Int,
         signal_recorder: SignalRecorder? = nil,
-        logger_factory: (() throws -> DaemonLogger)? = nil,
-        controller_process_inspector: ProcessInspecting? = nil
+        child_mode: ControllerChildMode = .normal
     ) -> DaemonFixture {
         let paths = make_runtime_paths(root: root)
         let state_process_inspector = DarwinProcessInspector()
-        let controller_inspector: ProcessInspecting = controller_process_inspector
-            ?? state_process_inspector
         let recorder = signal_recorder ?? SignalRecorder(handler: Darwin.kill)
         let store = Store(config_root: root.appendingPathComponent("config"))
         store.host = "127.0.0.1"
@@ -959,24 +1033,18 @@ struct DaemonControllerTests {
             paths: paths,
             process_inspector: state_process_inspector,
             trash_item: make_fixture_recycler(root: root))
-        let make_logger = logger_factory ?? {
-            DaemonLogger(
-                log_url: paths.log_path,
-                trash_item: make_fixture_recycler(root: root))
-        }
+        var child_environment = ProcessInfo.processInfo.environment
+        child_environment[TEST_DAEMON_ROOT_ENVIRONMENT] = root.path
+        child_environment[TEST_DAEMON_MODE_ENVIRONMENT] = child_mode.rawValue
         let controller = DaemonController(
             store: store,
-            generator: ControllerFakeGenerator(),
-            runtime_factory: { store, generator in
-                GatewayRuntime(store: store, generator: generator)
-            },
             state_store: state_store,
-            logger_factory: make_logger,
             health_checker: URLSessionHealthChecker(),
-            process_inspector: controller_inspector,
+            process_inspector: state_process_inspector,
             signal_sender: { pid, signal_number in
                 recorder.send(pid: pid, signal_number: signal_number)
-            })
+            },
+            spawn_environment: child_environment)
         return DaemonFixture(
             controller: controller,
             state_store: state_store,
@@ -1056,7 +1124,7 @@ struct DaemonControllerTests {
         }))
     }
 
-    // 功能：等待并回收当前测试进程直接 fork 的指定 child。
+    // 功能：等待并回收当前测试进程直接 spawn 的指定 child。
     // 参数：pid 为精确 child；timeout 为最长等待秒数。
     // 返回值：无；未能按时回收时抛错。
     private static func wait_for_child_exit(pid: Int32, timeout: TimeInterval) throws {
@@ -1074,7 +1142,7 @@ struct DaemonControllerTests {
         throw ControllerTestError.identity_uncertain
     }
 
-    // 功能：等待并回收当前测试进程直接 fork 的指定 child，
+    // 功能：等待并回收当前测试进程直接 spawn 的指定 child，
     // 并返回 wait status。
     // 参数：pid 为精确 child；timeout 为最长等待秒数。
     // 返回值：waitpid 写入的退出状态；未能按时回收时抛错。
@@ -1267,7 +1335,7 @@ struct DaemonControllerTests {
             root: root,
             port: port,
             signal_recorder: signal_recorder,
-            controller_process_inspector: DelayedProcessInspector(delay: 11))
+            child_mode: .late_readiness)
         let exit_code = fixture.controller.serve_daemon(options: ServeOptions(
             host: nil,
             port: nil,
@@ -1307,23 +1375,56 @@ struct DaemonControllerTests {
         try Data("EXIT \(exit_code.rawValue)\n".utf8).write(to: result_path)
     }
 
-    // 功能：验证空设备恰好打开为 fd 0 时 redirect 不会再次关闭 stdin。
-    // 参数：结果文件路径来自命令行。
-    // 返回值：把 redirect 结果和 stdin 打开状态写入文件。
-    private static func run_stdin_null_helper() throws {
-        guard CommandLine.arguments.count == 3 else {
-            throw ControllerTestError.socket_failed
+    // 功能：在 exec 后的全新测试进程中重建隔离依赖并运行 daemon child。
+    // 参数：invocation 仅包含保留 fd 与非敏感 endpoint 元数据。
+    // 返回值：不返回；DaemonChildRunner 以固定 CLI 码退出。
+    private static func run_internal_daemon_child(
+        _ invocation: DaemonChildInvocation
+    ) -> Never {
+        guard let root_path = ProcessInfo.processInfo.environment[
+            TEST_DAEMON_ROOT_ENVIRONMENT],
+              let mode_value = ProcessInfo.processInfo.environment[
+                  TEST_DAEMON_MODE_ENVIRONMENT],
+              let child_mode = ControllerChildMode(rawValue: mode_value) else {
+            _exit(CLIExitCode.usage.rawValue)
         }
-        let result_path = URL(fileURLWithPath: CommandLine.arguments[2])
-        _ = Darwin.close(STDIN_FILENO)
-        let redirected = redirect_stdin_to_null()
-        let stdin_open = fcntl(STDIN_FILENO, F_GETFD) >= 0
-        let output = "RESULT \(redirected ? 1 : 0) OPEN \(stdin_open ? 1 : 0)\n"
-        try Data(output.utf8).write(to: result_path)
+        let root = URL(fileURLWithPath: root_path)
+        let paths = make_runtime_paths(root: root)
+        let process_inspector: ProcessInspecting = child_mode == .late_readiness
+            ? DelayedProcessInspector(delay: 11)
+            : DarwinProcessInspector()
+        let state_store = RuntimeStateStore(
+            paths: paths,
+            process_inspector: process_inspector,
+            trash_item: make_fixture_recycler(root: root))
+        let logger_factory: () throws -> DaemonLogger = {
+            switch child_mode {
+            case .early_exit:
+                _exit(27)
+            case .readiness_timeout:
+                _ = Darwin.signal(SIGTERM, SIG_IGN)
+                Thread.sleep(forTimeInterval: 12)
+            case .normal, .late_readiness:
+                break
+            }
+            return DaemonLogger(
+                log_url: paths.log_path,
+                trash_item: make_fixture_recycler(root: root))
+        }
+        let store = Store(config_root: root.appendingPathComponent("config"))
+        let runner = DaemonChildRunner(
+            store: store,
+            generator: ControllerFakeGenerator(),
+            runtime_factory: { child_store, generator in
+                GatewayRuntime(store: child_store, generator: generator)
+            },
+            state_store: state_store,
+            logger_factory: logger_factory,
+            process_inspector: process_inspector)
+        runner.run(invocation)
     }
 
-    // 功能：fork 后只做 close 和 exec，
-    // 创建具有指定关闭标准 fd 的新测试进程。
+    // 功能：以 posix_spawn file actions 创建具有指定关闭标准 fd 的测试进程。
     // 参数：arguments 为 helper 参数；两个布尔值控制关闭 stdin 与 stdout/stderr。
     // 返回值：exec helper 的精确 PID。
     private static func spawn_exec_helper(
@@ -1338,21 +1439,45 @@ struct DaemonControllerTests {
             throw ControllerTestError.socket_failed
         }
         var argument_vector = pointers + [nil]
-        var child_pid: Int32 = -1
-        argument_vector.withUnsafeMutableBufferPointer { buffer in
-            child_pid = test_system_fork()
-            if child_pid == 0 {
-                if close_stdin { _ = Darwin.close(STDIN_FILENO) }
-                if close_output {
-                    _ = Darwin.close(STDOUT_FILENO)
-                    _ = Darwin.close(STDERR_FILENO)
-                }
-                Darwin.execv(buffer[0], buffer.baseAddress!)
-                _exit(127)
+        var file_actions: posix_spawn_file_actions_t?
+        guard posix_spawn_file_actions_init(&file_actions) == 0 else {
+            pointers.forEach { free($0) }
+            throw ControllerTestError.socket_failed
+        }
+        defer { posix_spawn_file_actions_destroy(&file_actions) }
+        if close_stdin {
+            guard posix_spawn_file_actions_addclose(
+                &file_actions,
+                STDIN_FILENO) == 0 else {
+                pointers.forEach { free($0) }
+                throw ControllerTestError.socket_failed
             }
         }
+        if close_output {
+            guard posix_spawn_file_actions_addclose(
+                &file_actions,
+                STDOUT_FILENO) == 0,
+                  posix_spawn_file_actions_addclose(
+                      &file_actions,
+                      STDERR_FILENO) == 0 else {
+                pointers.forEach { free($0) }
+                throw ControllerTestError.socket_failed
+            }
+        }
+        var child_pid: Int32 = -1
+        let spawn_result = argument_vector.withUnsafeMutableBufferPointer { buffer in
+            posix_spawn(
+                &child_pid,
+                buffer[0],
+                &file_actions,
+                nil,
+                buffer.baseAddress!,
+                test_get_environ().pointee)
+        }
         pointers.forEach { free($0) }
-        guard child_pid > 0 else { throw ControllerTestError.socket_failed }
+        guard spawn_result == 0, child_pid > 0 else {
+            throw ControllerTestError.socket_failed
+        }
         return child_pid
     }
 

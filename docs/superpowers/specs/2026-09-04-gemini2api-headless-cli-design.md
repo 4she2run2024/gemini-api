@@ -146,17 +146,26 @@ Gateway API Key 等敏感字段没有命令行参数，避免出现在 shell his
 2. 检查现有 daemon 状态；活动且身份匹配时返回所有权冲突。
 3. 对确认失效的 stale 状态执行废纸篓回收。
 4. 创建父子 readiness pipe。
-5. 调用 `fork()`；子进程调用 `setsid()`，脱离调用终端。
-6. 子进程把 stdin 指向 `/dev/null`，把 stdout/stderr 指向受控日志文件。
-7. 子进程启动 HTTP 服务，等待 listener ready。
-8. 子进程原子发布 daemon 状态，再通过 pipe 返回 ready。
-9. 父进程最多等待 10 秒；只有收到 ready 才返回退出码 0。
+5. 动态解析当前 executable path，并以 `posix_spawn` 启动同一 executable；
+   设置 `POSIX_SPAWN_SETSID`，不在多线程 parent 的 fork child 中执行 Swift、
+   Foundation 或 Network。
+6. spawn file actions 把标准流先稳定映射到 `/dev/null`，再把 lock 和 readiness
+   写端从受控高位源 fd 映射到不低于 3 的保留 child fd。
+7. 新进程先解析未公开的内部 child invocation，再重新加载 Store 并重建 generator、
+   runtime、state 和 logger；公开 parser 与帮助均不暴露该 invocation。
+8. exec child 接管 flock、把 stdout/stderr 指向受控日志文件，启动 HTTP 服务并
+   等待 listener ready。
+9. child 原子发布 daemon 状态，再通过 pipe 返回 ready；状态 executable path
+   必须来自 exec 后的真实进程身份。
+10. parent 在 spawn 成功后只关闭自己的 lock descriptor，不调用 `LOCK_UN`；
+    最多等待 10 秒，只有收到 ready 才返回退出码 0。
 
 `/dev/null` 是操作系统设备路径，不是用户数据路径；其他用户目录和临时
 路径均由系统 API 动态获取。
 
-子进程启动失败时，通过 readiness pipe 返回脱敏错误类别，回收未发布的
-staging 状态并退出。父进程不把“已经 fork”视为“服务已经可用”。
+child 启动失败时，通过 readiness pipe 返回脱敏错误类别，回收未发布的 staging
+状态并退出。readiness 超时时 parent 只发送一次 `SIGTERM`，用有界 `WNOHANG`
+回收，不发送 `SIGKILL`，也不把“已经 spawn”视为“服务已经可用”。
 
 ### 6.2 单实例与并发启动
 
@@ -302,7 +311,8 @@ Sources/cli/daemon-logger.swift
 - `GatewayRuntime`：启动/停止共享 HTTP 服务、等待 ready、管理安全信号源；
   可注入 generator 和 Store 以便测试。
 - `CLICommand`：纯参数解析和退出码映射，不接触 Network 或文件系统。
-- `DaemonController`：fork、setsid、readiness、status 和 stop orchestration。
+- `DaemonController`：posix_spawn、fd transfer、readiness、status 和 stop orchestration。
+- `DaemonChildRunner`：在 exec 后接管 lock，重建依赖后启动、发布和清理 daemon。
 - `RuntimeStateStore`：动态路径、权限、原子 JSON 状态、锁和废纸篓回收。
 - `DaemonLogger`：stdio 重定向、大小检查和可恢复轮转。
 

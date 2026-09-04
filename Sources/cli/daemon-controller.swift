@@ -6,13 +6,79 @@ import Darwin
 import Foundation
 import Network
 
-@_silgen_name("fork")
-private func system_fork() -> pid_t
-
 private let HEALTH_CHECK_TIMEOUT_SECONDS: TimeInterval = 2
 private let STOP_POLL_INTERVAL_SECONDS: TimeInterval = 0.02
 private let DAEMON_READINESS_TIMEOUT_SECONDS: TimeInterval = 10
 private let DAEMON_REAP_TIMEOUT_SECONDS: TimeInterval = 0.25
+private let DAEMON_LOCK_DESCRIPTOR: Int32 = 3
+private let DAEMON_READINESS_DESCRIPTOR: Int32 = 4
+private let SPAWN_SOURCE_DESCRIPTOR_MINIMUM: Int32 = 64
+
+enum DaemonChildInvocationParseResult: Equatable {
+    case not_internal
+    case invalid
+    case invocation(DaemonChildInvocation)
+}
+
+struct DaemonChildInvocation: Equatable {
+    static let marker = "--gemini2api-internal-daemon-child"
+
+    let readiness_descriptor: Int32
+    let lock_descriptor: Int32
+    let host: String
+    let port: Int
+    let model: String
+
+    // 功能：生成只含保留 fd 和非敏感 endpoint 元数据的内部 child 参数。
+    // 参数：无。
+    // 返回值：不含 executable path 的固定位置参数。
+    var command_arguments: [String] {
+        [
+            Self.marker,
+            String(readiness_descriptor),
+            String(lock_descriptor),
+            host,
+            String(port),
+            model,
+        ]
+    }
+
+    // 功能：在公开 CLI parser 之前识别固定格式的隐藏 child invocation。
+    // 参数：arguments 含 executable path 和完整参数。
+    // 返回值：非内部请求、非法内部请求或结构化 invocation。
+    static func parse(arguments: [String]) -> DaemonChildInvocationParseResult {
+        guard arguments.count > 1, arguments[1] == marker else {
+            return .not_internal
+        }
+        guard arguments.count == 7,
+              let readiness_descriptor = Int32(arguments[2]),
+              let lock_descriptor = Int32(arguments[3]),
+              readiness_descriptor == DAEMON_READINESS_DESCRIPTOR,
+              lock_descriptor == DAEMON_LOCK_DESCRIPTOR,
+              readiness_descriptor != lock_descriptor,
+              valid_internal_text(arguments[4]),
+              let port = Int(arguments[5]),
+              (1...65_535).contains(port),
+              valid_internal_text(arguments[6]) else {
+            return .invalid
+        }
+        return .invocation(DaemonChildInvocation(
+            readiness_descriptor: readiness_descriptor,
+            lock_descriptor: lock_descriptor,
+            host: arguments[4],
+            port: port,
+            model: arguments[6]))
+    }
+
+    // 功能：拒绝空值、NUL 与控制字符，保持 argv 边界稳定。
+    // 参数：value 为 host 或 model。
+    // 返回值：可安全作为单个 argv 字段时为 true。
+    private static func valid_internal_text(_ value: String) -> Bool {
+        !value.isEmpty && !value.unicodeScalars.contains(where: {
+            $0.value < 0x20 || $0.value == 0x7F
+        })
+    }
+}
 
 private enum DaemonReadiness: UInt8 {
     case ready = 1
@@ -210,39 +276,34 @@ private func classify_response(
 
 final class DaemonController {
     private let store: Store
-    private let generator: TextGenerating
-    private let runtime_factory: (Store, TextGenerating) -> GatewayRuntime
     private let state_store: RuntimeStateStore
-    private let logger_factory: () throws -> DaemonLogger
     private let health_checker: HealthChecking
     private let process_inspector: ProcessInspecting
     private let signal_sender: (Int32, Int32) -> Int32
+    private let spawn_environment: [String: String]
 
     // 功能：创建可测试的 daemon 生命周期编排器。
-    // 参数：store 为已加载配置；generator 仅供 runtime 构造；
-    // 其余参数为边界依赖。
+    // 参数：store 为已加载配置；其余参数为状态、健康、进程、信号和
+    // spawn 边界。
     // 返回值：初始化后的编排器。
     init(
         store: Store,
-        generator: TextGenerating,
-        runtime_factory: @escaping (Store, TextGenerating) -> GatewayRuntime,
         state_store: RuntimeStateStore,
-        logger_factory: @escaping () throws -> DaemonLogger,
         health_checker: HealthChecking,
         process_inspector: ProcessInspecting,
-        signal_sender: @escaping (Int32, Int32) -> Int32
+        signal_sender: @escaping (Int32, Int32) -> Int32,
+        spawn_environment: [String: String] = ProcessInfo.processInfo.environment
     ) {
         self.store = store
-        self.generator = generator
-        self.runtime_factory = runtime_factory
         self.state_store = state_store
-        self.logger_factory = logger_factory
         self.health_checker = health_checker
         self.process_inspector = process_inspector
         self.signal_sender = signal_sender
+        self.spawn_environment = spawn_environment
     }
 
-    // 功能：持锁解析当前状态，再 fork 并等待 child 完整 ready。
+    // 功能：持锁解析当前状态，再 posix_spawn 同一 executable，
+    // 并等待 child 完整 ready。
     // 参数：options 为本次只驻留内存的 serve 覆盖，必须标记 daemon。
     // 返回值：ready、冲突或运行时失败对应的 CLI 退出码。
     func serve_daemon(options: ServeOptions) -> CLIExitCode {
@@ -270,23 +331,32 @@ final class DaemonController {
 
         var pipe_descriptors = [Int32](repeating: -1, count: 2)
         guard Darwin.pipe(&pipe_descriptors) == 0 else { return .runtime }
-        set_close_on_exec_best_effort(pipe_descriptors[0])
-        set_close_on_exec_best_effort(pipe_descriptors[1])
-
-        let child_pid = system_fork()
-        guard child_pid >= 0 else {
+        guard set_close_on_exec(pipe_descriptors[0]),
+              set_close_on_exec(pipe_descriptors[1]) else {
             _ = Darwin.close(pipe_descriptors[0])
             _ = Darwin.close(pipe_descriptors[1])
             return .runtime
         }
-        if child_pid == 0 {
+
+        let invocation = DaemonChildInvocation(
+            readiness_descriptor: DAEMON_READINESS_DESCRIPTOR,
+            lock_descriptor: DAEMON_LOCK_DESCRIPTOR,
+            host: options.host ?? store.host,
+            port: options.port ?? store.port,
+            model: options.model ?? store.defaultModel)
+        guard let executable_path = current_executable_path(),
+              let child_pid = spawn_daemon_child(
+                  executable_path: executable_path,
+                  invocation: invocation,
+                  readiness_source: pipe_descriptors[1],
+                  daemon_lock: daemon_lock,
+                  environment: spawn_environment) else {
             _ = Darwin.close(pipe_descriptors[0])
-            run_daemon_child(
-                options: options,
-                readiness_descriptor: pipe_descriptors[1],
-                daemon_lock: daemon_lock)
+            _ = Darwin.close(pipe_descriptors[1])
+            return .runtime
         }
 
+        daemon_lock.relinquish_after_spawn_in_parent()
         _ = Darwin.close(pipe_descriptors[1])
         let readiness = wait_for_parent_readiness(
             descriptor: pipe_descriptors[0],
@@ -294,7 +364,6 @@ final class DaemonController {
         _ = Darwin.close(pipe_descriptors[0])
         switch readiness {
         case .message(.ready):
-            daemon_lock.relinquish_after_fork_in_parent()
             return .success
         case .message(.conflict):
             reap_child(child_pid)
@@ -455,21 +524,51 @@ final class DaemonController {
     private func health_probe_host(_ host: String) -> String {
         host == "0.0.0.0" ? "127.0.0.1" : host
     }
+}
 
-    // 功能：在 fork child 中按安全顺序启动 daemon，并以固定 byte 报告结果。
-    // 参数：options 为覆盖；readiness_descriptor 为 pipe 写端；
-    // daemon_lock 保持持锁。
+final class DaemonChildRunner {
+    private let store: Store
+    private let generator: TextGenerating
+    private let runtime_factory: (Store, TextGenerating) -> GatewayRuntime
+    private let state_store: RuntimeStateStore
+    private let logger_factory: () throws -> DaemonLogger
+    private let process_inspector: ProcessInspecting
+
+    // 功能：创建只在 exec 后新进程内使用的 daemon child runner。
+    // 参数：store、generator、runtime、state、logger 和进程查询
+    // 均由 @main 重建注入。
+    // 返回值：初始化后的 runner。
+    init(
+        store: Store,
+        generator: TextGenerating,
+        runtime_factory: @escaping (Store, TextGenerating) -> GatewayRuntime,
+        state_store: RuntimeStateStore,
+        logger_factory: @escaping () throws -> DaemonLogger,
+        process_inspector: ProcessInspecting
+    ) {
+        self.store = store
+        self.generator = generator
+        self.runtime_factory = runtime_factory
+        self.state_store = state_store
+        self.logger_factory = logger_factory
+        self.process_inspector = process_inspector
+    }
+
+    // 功能：在 exec child 中接管 flock，启动 daemon，并以固定 byte 报告结果。
+    // 参数：invocation 为已解析的保留 fd 与 endpoint 元数据。
     // 返回值：不返回；最终调用 _exit。
-    private func run_daemon_child(
-        options: ServeOptions,
-        readiness_descriptor: Int32,
-        daemon_lock: DaemonLock
-    ) -> Never {
-        _ = daemon_lock
+    func run(_ invocation: DaemonChildInvocation) -> Never {
         _ = Darwin.signal(SIGPIPE, SIG_IGN)
-        guard setsid() >= 0, redirect_stdin_to_null() else {
-            _ = write_readiness(.runtime_failure, to: readiness_descriptor)
-            _ = Darwin.close(readiness_descriptor)
+        let daemon_lock: DaemonLock
+        do {
+            daemon_lock = try DaemonLock.adopt_after_spawn(
+                descriptor: invocation.lock_descriptor)
+        } catch {
+            _ = write_readiness(
+                .runtime_failure,
+                to: invocation.readiness_descriptor)
+            _ = Darwin.close(invocation.readiness_descriptor)
+            _ = Darwin.close(invocation.lock_descriptor)
             _exit(CLIExitCode.runtime.rawValue)
         }
 
@@ -490,9 +589,9 @@ final class DaemonController {
             let child_runtime = runtime_factory(store, generator)
             runtime = child_runtime
             let endpoint = try child_runtime.configure(RuntimeOverrides(
-                host: options.host,
-                port: options.port,
-                model: options.model))
+                host: invocation.host,
+                port: invocation.port,
+                model: invocation.model))
             child_runtime.install_termination_handlers()
             try child_runtime.start(readiness_timeout: DAEMON_READINESS_TIMEOUT_SECONDS)
             child_logger.start_rotation_monitor()
@@ -540,8 +639,10 @@ final class DaemonController {
                 ])
         }
 
-        let readiness_written = write_readiness(outcome, to: readiness_descriptor)
-        _ = Darwin.close(readiness_descriptor)
+        let readiness_written = write_readiness(
+            outcome,
+            to: invocation.readiness_descriptor)
+        _ = Darwin.close(invocation.readiness_descriptor)
         if outcome == .ready && !readiness_written {
             logger?.write(
                 .error,
@@ -558,6 +659,7 @@ final class DaemonController {
             if let published_state {
                 recycle_state_if_owned(published_state)
             }
+            daemon_lock.unlock()
             _exit(outcome == .conflict
                 ? CLIExitCode.conflict.rawValue
                 : CLIExitCode.runtime.rawValue)
@@ -567,6 +669,7 @@ final class DaemonController {
         runtime?.stop()
         logger?.stop()
         recycle_state_if_owned(published_state)
+        daemon_lock.unlock()
         _exit(CLIExitCode.success.rawValue)
     }
 
@@ -604,16 +707,160 @@ func daemon_listener_exit_code(_ error: Error) -> CLIExitCode {
     return .runtime
 }
 
-// 功能：让 daemon child 的 stdin 指向操作系统空设备。
+// 功能：解析当前实际 executable path，确保状态身份与 exec 目标一致。
 // 参数：无。
-// 返回值：打开和 dup2 均成功时为 true。
-func redirect_stdin_to_null() -> Bool {
-    let descriptor = Darwin.open("/dev/null", O_RDONLY | O_CLOEXEC)
-    guard descriptor >= 0 else { return false }
-    if descriptor == STDIN_FILENO { return true }
-    let redirected = Darwin.dup2(descriptor, STDIN_FILENO) >= 0
-    _ = Darwin.close(descriptor)
-    return redirected
+// 返回值：proc_pidpath 成功时为当前 executable path，否则为 nil。
+private func current_executable_path() -> String? {
+    try? DarwinProcessInspector().inspect(pid: getpid())?.executable_path
+}
+
+// 功能：以 setsid 的 posix_spawn 把锁和 readiness 映射到保留 child fd。
+// 参数：executable、invocation、源 fd、锁和环境均来自当前启动事务。
+// 返回值：spawn 成功后的精确 child PID；任一步失败为 nil。
+private func spawn_daemon_child(
+    executable_path: String,
+    invocation: DaemonChildInvocation,
+    readiness_source: Int32,
+    daemon_lock: DaemonLock,
+    environment: [String: String]
+) -> Int32? {
+    let lock_source: Int32
+    do {
+        lock_source = try daemon_lock.duplicate_for_spawn(
+            minimum_descriptor: SPAWN_SOURCE_DESCRIPTOR_MINIMUM)
+    } catch {
+        return nil
+    }
+    defer { _ = Darwin.close(lock_source) }
+
+    let readiness_copy = fcntl(
+        readiness_source,
+        F_DUPFD_CLOEXEC,
+        SPAWN_SOURCE_DESCRIPTOR_MINIMUM)
+    guard readiness_copy >= SPAWN_SOURCE_DESCRIPTOR_MINIMUM else { return nil }
+    defer { _ = Darwin.close(readiness_copy) }
+
+    var file_actions: posix_spawn_file_actions_t?
+    guard posix_spawn_file_actions_init(&file_actions) == 0 else { return nil }
+    defer { posix_spawn_file_actions_destroy(&file_actions) }
+    guard add_standard_stream_actions(&file_actions),
+          posix_spawn_file_actions_adddup2(
+              &file_actions,
+              lock_source,
+              invocation.lock_descriptor) == 0,
+          posix_spawn_file_actions_adddup2(
+              &file_actions,
+              readiness_copy,
+              invocation.readiness_descriptor) == 0,
+          posix_spawn_file_actions_addinherit_np(
+              &file_actions,
+              invocation.lock_descriptor) == 0,
+          posix_spawn_file_actions_addinherit_np(
+              &file_actions,
+              invocation.readiness_descriptor) == 0,
+          posix_spawn_file_actions_addclose(&file_actions, lock_source) == 0,
+          posix_spawn_file_actions_addclose(&file_actions, readiness_copy) == 0 else {
+        return nil
+    }
+
+    var attributes: posix_spawnattr_t?
+    guard posix_spawnattr_init(&attributes) == 0 else { return nil }
+    defer { posix_spawnattr_destroy(&attributes) }
+    guard posix_spawnattr_setflags(
+        &attributes,
+        Int16(POSIX_SPAWN_SETSID)) == 0 else {
+        return nil
+    }
+
+    let arguments = [executable_path] + invocation.command_arguments
+    let environment_entries = environment.keys.sorted().compactMap { key -> String? in
+        guard !key.isEmpty, !key.contains("="), !key.utf8.contains(0),
+              let value = environment[key], !value.utf8.contains(0) else {
+            return nil
+        }
+        return "\(key)=\(value)"
+    }
+    guard environment_entries.count == environment.count,
+          arguments.allSatisfy({ !$0.utf8.contains(0) }) else {
+        return nil
+    }
+    return spawn_process(
+        executable_path: executable_path,
+        arguments: arguments,
+        environment: environment_entries,
+        file_actions: &file_actions,
+        attributes: &attributes)
+}
+
+// 功能：为 exec child 预先把三个标准流稳定映射到 /dev/null。
+// 参数：file_actions 为已初始化的 spawn actions。
+// 返回值：三个 addopen 全部成功时为 true。
+private func add_standard_stream_actions(
+    _ file_actions: inout posix_spawn_file_actions_t?
+) -> Bool {
+    "/dev/null".withCString { null_path in
+        posix_spawn_file_actions_addopen(
+            &file_actions,
+            STDIN_FILENO,
+            null_path,
+            O_RDONLY,
+            0) == 0
+            && posix_spawn_file_actions_addopen(
+                &file_actions,
+                STDOUT_FILENO,
+                null_path,
+                O_WRONLY,
+                0) == 0
+            && posix_spawn_file_actions_addopen(
+                &file_actions,
+                STDERR_FILENO,
+                null_path,
+                O_WRONLY,
+                0) == 0
+    }
+}
+
+// 功能：把 Swift 字符串安全转换为 C argv/envp 并执行 posix_spawn。
+// 参数：path、arguments、environment 及已配置 actions/attributes。
+// 返回值：成功为正 child PID，失败为 nil。
+private func spawn_process(
+    executable_path: String,
+    arguments: [String],
+    environment: [String],
+    file_actions: inout posix_spawn_file_actions_t?,
+    attributes: inout posix_spawnattr_t?
+) -> Int32? {
+    let argument_pointers = arguments.map { strdup($0) }
+    guard argument_pointers.allSatisfy({ $0 != nil }) else {
+        argument_pointers.forEach { free($0) }
+        return nil
+    }
+    defer { argument_pointers.forEach { free($0) } }
+    let environment_pointers = environment.map { strdup($0) }
+    guard environment_pointers.allSatisfy({ $0 != nil }) else {
+        environment_pointers.forEach { free($0) }
+        return nil
+    }
+    defer { environment_pointers.forEach { free($0) } }
+
+    var argument_vector = argument_pointers + [nil]
+    var environment_vector = environment_pointers + [nil]
+    var child_pid: Int32 = -1
+    let result = executable_path.withCString { path in
+        argument_vector.withUnsafeMutableBufferPointer { argument_buffer in
+            environment_vector.withUnsafeMutableBufferPointer { environment_buffer in
+                posix_spawn(
+                    &child_pid,
+                    path,
+                    &file_actions,
+                    &attributes,
+                    argument_buffer.baseAddress!,
+                    environment_buffer.baseAddress!)
+            }
+        }
+    }
+    guard result == 0, child_pid > 0 else { return nil }
+    return child_pid
 }
 
 // 功能：在获取 lock 和创建 pipe 前用空设备补齐标准 fd，
@@ -636,13 +883,13 @@ private func ensure_standard_descriptors() -> Bool {
     return true
 }
 
-// 功能：为 readiness pipe 设置 close-on-exec，避免未来 exec 泄漏。
+// 功能：为 readiness pipe 设置 close-on-exec，避免原始 fd 跨 exec 泄漏。
 // 参数：descriptor 为 pipe fd。
-// 返回值：无；当前进程不 exec，因此失败不改变协议正确性。
-private func set_close_on_exec_best_effort(_ descriptor: Int32) {
+// 返回值：读取并设置 descriptor flag 均成功时为 true。
+private func set_close_on_exec(_ descriptor: Int32) -> Bool {
     let flags = fcntl(descriptor, F_GETFD)
-    guard flags >= 0 else { return }
-    _ = fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC)
+    guard flags >= 0 else { return false }
+    return fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC) == 0
 }
 
 // 功能：向 pipe 完整写入一个固定 readiness 枚举 byte。
@@ -692,7 +939,7 @@ private func wait_for_parent_readiness(
 }
 
 // 功能：同步回收一个确认属于当前 parent 的已退出 child。
-// 参数：pid 为 fork 返回的精确 child PID。
+// 参数：pid 为 posix_spawn 返回的精确 child PID。
 // 返回值：无；EINTR 时重试，其余错误结束。
 private func reap_child(_ pid: Int32) {
     var status: Int32 = 0
@@ -702,7 +949,7 @@ private func reap_child(_ pid: Int32) {
 }
 
 // 功能：在固定短期限内尝试回收精确 child，不阻塞 daemon parent 退出。
-// 参数：pid 为 fork 返回的 child；timeout 为最长等待秒数。
+// 参数：pid 为 posix_spawn 返回的 child；timeout 为最长等待秒数。
 // 返回值：期限内已回收或已无 child 时为 true，否则为 false。
 @discardableResult
 private func reap_child_if_exited(_ pid: Int32, timeout: TimeInterval) -> Bool {

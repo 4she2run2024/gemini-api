@@ -76,15 +76,50 @@ final class DaemonLock {
         descriptor = -1
     }
 
-    // 功能：fork 成功后仅关闭 parent 的 descriptor，不解除 child 继承的 flock。
+    // 功能：复制已加锁 descriptor，供 posix_spawn 映射至 child 保留 fd。
+    // 参数：minimum_descriptor 为复制结果的最小 fd，必须不低于 3。
+    // 返回值：共享同一 open-file-description 且带 CLOEXEC 的新 descriptor。
+    func duplicate_for_spawn(minimum_descriptor: Int32) throws -> Int32 {
+        state_lock.lock()
+        defer { state_lock.unlock() }
+        guard descriptor >= 0, minimum_descriptor >= 3 else {
+            throw RuntimeStateError.system_call_failed
+        }
+        let duplicated_descriptor = fcntl(
+            descriptor,
+            F_DUPFD_CLOEXEC,
+            minimum_descriptor)
+        guard duplicated_descriptor >= minimum_descriptor else {
+            throw RuntimeStateError.system_call_failed
+        }
+        return duplicated_descriptor
+    }
+
+    // 功能：spawn 成功后仅关闭 parent descriptor，
+    // 不显式解除 child 继承的 flock。
     // 参数：无。
     // 返回值：无；重复调用保持幂等。
-    func relinquish_after_fork_in_parent() {
+    func relinquish_after_spawn_in_parent() {
         state_lock.lock()
         defer { state_lock.unlock() }
         guard descriptor >= 0 else { return }
         _ = Darwin.close(descriptor)
         descriptor = -1
+    }
+
+    // 功能：在 exec child 中接管 parent 映射的锁 descriptor。
+    // 参数：descriptor 必须不低于 3、有效且指向 regular file。
+    // 返回值：负责最终 unlock 和 close 的锁句柄。
+    static func adopt_after_spawn(descriptor: Int32) throws -> DaemonLock {
+        guard descriptor >= 3, fcntl(descriptor, F_GETFD) >= 0 else {
+            throw RuntimeStateError.system_call_failed
+        }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0,
+              info.st_mode & S_IFMT == S_IFREG else {
+            throw RuntimeStateError.system_call_failed
+        }
+        return DaemonLock(descriptor: descriptor)
     }
 
     deinit {

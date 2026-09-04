@@ -55,6 +55,7 @@ struct CLICommandTests {
         expect_usage_error(["serve", "--port"])
         expect_usage_error(["serve", "--daemon", "--daemon"])
         expect_usage_error(["status", "--daemon"])
+        expect_usage_error(["--gemini2api-internal-daemon-child"])
         expect_usage_error(["serve", "--model", "unknown-model"])
         expect_usage_error(["serve", "--model", "gemini-3.8-flash@think=5"])
         expect_usage_error(["serve", "--model", "gemini-3.8-flash@think=bogus"])

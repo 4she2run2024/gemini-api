@@ -49,7 +49,8 @@ GitHub Actions；App 保留 AppKit 与 ServiceManagement，CLI 不链接 AppKit�
 - `Sources/cli/cli-command.swift`：纯命令解析、帮助、版本和退出码。
 - `Sources/cli/runtime-state.swift`：动态路径、锁、状态 JSON、权限和进程身份。
 - `Sources/cli/daemon-logger.swift`：daemon stdio、脱敏日志和 5 MiB 轮转。
-- `Sources/cli/daemon-controller.swift`：fork、readiness、status、stop 和单实例编排。
+- `Sources/cli/daemon-controller.swift`：posix_spawn/exec、readiness、status、stop
+  和单实例。
 - `Sources/cli/cli-main.swift`：CLI `@main` 入口和依赖装配。
 - `Tests/cli-command-tests.swift`：命令、参数和模型覆盖契约。
 - `Tests/gateway-runtime-tests.swift`：配置不落盘、ready、失败和信号生命周期。
@@ -504,16 +505,31 @@ enum HealthResult: Equatable {
 final class DaemonController {
     init(
         store: Store,
-        runtime_factory: @escaping (Store, TextGenerating) -> GatewayRuntime,
         state_store: RuntimeStateStore,
-        logger_factory: @escaping () throws -> DaemonLogger,
         health_checker: HealthChecking,
         process_inspector: ProcessInspecting,
-        signal_sender: @escaping (Int32, Int32) -> Int32
+        signal_sender: @escaping (Int32, Int32) -> Int32,
+        spawn_environment: [String: String]
     )
     func serve_daemon(options: ServeOptions) -> CLIExitCode
     func status() -> (StatusReport, CLIExitCode)
     func stop(timeout: TimeInterval) -> CLIExitCode
+}
+
+struct DaemonChildInvocation: Equatable {
+    static func parse(arguments: [String]) -> DaemonChildInvocationParseResult
+}
+
+final class DaemonChildRunner {
+    init(
+        store: Store,
+        generator: TextGenerating,
+        runtime_factory: @escaping (Store, TextGenerating) -> GatewayRuntime,
+        state_store: RuntimeStateStore,
+        logger_factory: @escaping () throws -> DaemonLogger,
+        process_inspector: ProcessInspecting
+    )
+    func run(_ invocation: DaemonChildInvocation) -> Never
 }
 ```
 
@@ -546,6 +562,9 @@ final class DaemonController {
 - 占用端口的 fake owner 仍存活，daemon 返回 4 且不发送 signal。
 - 子进程只有 listener ready、state 原子发布成功后才向父进程写 ready。
 - readiness 10 秒超时或 child early exit 均返回 5。
+- parent 已有额外活动线程时，daemon 仍能 ready、status 和 stop。
+- 关闭标准 fd 的独立 helper 中，lock/readiness fd 仍稳定且启动结果确定。
+- 内部 child invocation 固定使用保留 fd，不被公开 parser 或帮助接受、展示。
 
 - [ ] **Step 3: 运行测试并确认 RED**
 
@@ -565,11 +584,17 @@ Expected: FAIL，找不到 `DaemonController`。
 
 - [ ] **Step 5: 实现 daemon start 和安全 stop**
 
-在启动 Network 线程前取得 lock。父子使用 pipe 传固定枚举结果，不传
-原始错误文本。child 执行 `fork`、`setsid`、stdin `/dev/null`、logger redirect、
-runtime start、state
-publish、ready；退出时停止 listener/logger，重新核对自身 state 后只回收
-自己的状态。
+在启动 Network 线程前取得 lock。parent 动态解析当前 executable path，把 lock 和
+readiness 源 fd 复制到受控高位后，用 `posix_spawn` 和 `POSIX_SPAWN_SETSID` 执行
+同一 executable。file actions 把标准流映射到 `/dev/null`，把 lock/readiness 映射到
+保留 child fd；parent 只 close 自己的 flock descriptor，不显式 `LOCK_UN`。
+
+exec 后由隐藏 invocation 进入 `DaemonChildRunner`，重建 Store、generator、runtime、
+state 和 logger。child 只通过 pipe 传固定枚举，不传原始错误；完成 runtime
+start、
+state publish 后才写 ready。退出时停止 listener/logger，重新核对自身 state 后只
+回收自己的状态。Task 5 的测试 `@main` 注入隔离路径和 fake generator；Task 6 的
+production `@main` 注入 `Store.shared`、`Engine.shared` 与当前用户运行路径。
 
 stop 通过可注入 signal sender 发送一次 `SIGTERM`，按 PID + executable path + start
 time 轮询。任何不确定身份直接拒绝；timeout 不升级信号。
@@ -657,9 +682,12 @@ Expected: FAIL，缺少 CLI `@main` 或测试 binary。
 `RuntimeOverrides`；foreground 直接运行 `GatewayRuntime`；daemon/status/stop 交给
 `DaemonController`。所有 user-facing 错误写 stderr，stdout 仅保留正常结果或 JSON。
 
-production `@main` 只在未定义 `GEMINI2API_LIBRARY` 时编译，并使用
-`Store.shared`、`Engine.shared`、`RuntimePaths.current_user()` 和 Darwin process/signal
-实现。测试开关不得改变 Release binary 的命令或路径契约。
+production `@main` 只在未定义 `GEMINI2API_LIBRARY` 时编译。它必须在公开 CLI parser
+前检测 `DaemonChildInvocation`：有效 invocation 以 `Store.shared`、`Engine.shared`、
+`RuntimePaths.current_user()`、logger 和 Darwin process inspector 重建
+`DaemonChildRunner`，并在构造 runtime 前调用 `Store.shared.load()` 恢复非 argv
+配置；非法内部 invocation 返回 usage。普通命令继续进入
+`CLIApplication`。测试开关不得改变 Release binary 的公开命令或路径契约。
 
 - [ ] **Step 4: 验证端到端 GREEN**
 
@@ -891,7 +919,7 @@ request body。
 审查范围为 `origin/main...HEAD`，重点检查：
 
 - PID reuse/EPERM/path/start-time 所有权边界。
-- fork 前无线程、ready 后才发布成功、stop 不误杀。
+- 多线程 parent 只走 posix_spawn/exec、ready 后才发布成功、stop 不误杀。
 - 原子 state、权限、symlink 和 Trash 语义。
 - stdout/stderr 轮转顺序和敏感信息白名单。
 - CLI source manifest 不含 AppKit，App 行为无回归。

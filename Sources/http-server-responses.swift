@@ -1,11 +1,11 @@
 import Foundation
 import Network
 
-// 用途：适配 OpenAI Responses 请求和非流式响应。
+// 用途：适配 OpenAI Responses 请求、响应对象和 SSE 事件。
 // 使用方法：HTTPServer 将请求规范化后交给 GatewayPipeline 执行。
 
 extension HTTPServer {
-    // 功能：解析并执行 OpenAI Responses 请求，返回非流式 Response object。
+    // 功能：解析并执行 OpenAI Responses 请求，返回 JSON 或 SSE。
     // 参数：conn 为客户端连接；body 为 JSON 请求体。
     // 返回值：无。
     func handle_responses(_ conn: NWConnection, body: Data) {
@@ -23,12 +23,25 @@ extension HTTPServer {
                 request,
                 default_model: cfg.defaultModel)
             let context = try pipeline.prepare(gateway_request)
+            let response_id = "resp_" + randomHex(24)
+            if gateway_request.stream {
+                if context.tool_policy.active {
+                    let result = try pipeline.generate(context)
+                    stream_responses_tools(
+                        conn,
+                        result: result,
+                        response_id: response_id)
+                } else {
+                    stream_responses_text(
+                        conn,
+                        pipeline: pipeline,
+                        context: context,
+                        response_id: response_id)
+                }
+                return
+            }
             let result = try pipeline.generate(context)
-            sendJSON(
-                conn,
-                make_responses_response(
-                    result,
-                    response_id: "resp_" + randomHex(24)))
+            sendJSON(conn, make_responses_response(result, response_id: response_id))
         } catch let error as GatewayProtocolError {
             sendJSON(
                 conn,
@@ -41,6 +54,97 @@ extension HTTPServer {
         } catch {
             sendJSON(conn, ["error": ["message": "\(error)"]], status: 400)
         }
+    }
+
+    // 功能：流式生成纯文本 Responses 事件，并传播客户端取消。
+    // 参数：conn 为连接；pipeline 为管线；context 为上下文；response_id 为 ID。
+    // 返回值：无。
+    private func stream_responses_text(
+        _ conn: NWConnection,
+        pipeline: GatewayPipeline,
+        context: GatewayExecutionContext,
+        response_id: String
+    ) {
+        let gone = ClientGone()
+        conn.stateUpdateHandler = { state in
+            if case .failed = state { gone.on = true }
+            if case .cancelled = state { gone.on = true }
+        }
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 1) {
+            _, _, is_complete, error in
+            if is_complete || error != nil { gone.on = true }
+        }
+
+        var encoder = ResponsesStreamEncoder(
+            response_id: response_id,
+            model: context.model.name)
+        startSSE(conn)
+        encoder.start_events().forEach {
+            sseSend(conn, $0, gone: gone)
+        }
+        var text = ""
+        do {
+            try pipeline.stream_text(
+                context,
+                is_cancelled: { gone.on }
+            ) { delta in
+                guard !gone.on else { return }
+                text += delta
+                self.sseSend(conn, encoder.text_delta(delta), gone: gone)
+            }
+            guard !gone.on else { return }
+            let result = GatewayResult(
+                model: context.model.name,
+                text: text,
+                tool_calls: [],
+                finish_reason: .stop,
+                usage: GatewayUsage(
+                    input_tokens: approximateTokenCount(context.generation.prompt),
+                    output_tokens: approximateTokenCount(text)))
+            let events = encoder.finish_text(result)
+            send_responses_final_events(conn, events: events, gone: gone)
+        } catch let error as GatewayProtocolError {
+            guard !gone.on else { return }
+            sseFinish(conn, encoder.error_event(error))
+        } catch {
+            guard !gone.on else { return }
+            sseFinish(conn, encoder.error_event(.upstream(String(describing: error))))
+        }
+    }
+
+    // 功能：把已完整解析的工具调用编码为 Responses SSE。
+    // 参数：conn 为连接；result 为结果；response_id 为响应 ID。
+    // 返回值：无。
+    private func stream_responses_tools(
+        _ conn: NWConnection,
+        result: GatewayResult,
+        response_id: String
+    ) {
+        var encoder = ResponsesStreamEncoder(
+            response_id: response_id,
+            model: result.model)
+        let events = encoder.start_events() + encoder.finish_tools(result)
+        startSSE(conn)
+        send_responses_final_events(conn, events: events, gone: ClientGone())
+    }
+
+    // 功能：顺序写出事件，最后一项写完后关闭连接。
+    // 参数：conn 为连接；events 为 SSE 事件；gone 跟踪客户端断开。
+    // 返回值：无。
+    private func send_responses_final_events(
+        _ conn: NWConnection,
+        events: [String],
+        gone: ClientGone
+    ) {
+        guard let final_event = events.last else {
+            conn.cancel()
+            return
+        }
+        for event in events.dropLast() where !gone.on {
+            sseSend(conn, event, gone: gone)
+        }
+        guard !gone.on else { return }
+        sseFinish(conn, final_event)
     }
 }
 
@@ -76,26 +180,26 @@ func make_responses_response(
     _ result: GatewayResult,
     response_id: String
 ) -> [String: Any] {
-    var output: [[String: Any]] = []
-    if !result.text.isEmpty {
-        output.append([
-            "id": "msg_" + randomHex(24),
-            "type": "message",
-            "status": "completed",
-            "role": "assistant",
-            "content": [[
-                "type": "output_text",
-                "text": result.text,
-                "annotations": [],
-            ]],
-        ])
-    }
-    output.append(contentsOf: result.tool_calls.map(responses_function_call_item))
+    make_responses_response(
+        result,
+        response_id: response_id,
+        created_at: nowUnix(),
+        output: responses_output_items(result))
+}
 
-    return [
+// 功能：为 SSE 编码响应对象，保留事件已分配的时间和 item ID。
+// 参数：result 为结果；response_id 为 ID；created_at 为时间；output 为输出项。
+// 返回值：completed Response object。
+private func make_responses_response(
+    _ result: GatewayResult,
+    response_id: String,
+    created_at: Int,
+    output: [[String: Any]]
+) -> [String: Any] {
+    [
         "id": response_id,
         "object": "response",
-        "created_at": nowUnix(),
+        "created_at": created_at,
         "status": "completed",
         "background": false,
         "error": NSNull(),
@@ -114,6 +218,301 @@ func make_responses_response(
             "total_tokens": result.usage.total_tokens,
         ],
     ]
+}
+
+// 功能：按文本、工具顺序构造 completed Responses output items。
+// 参数：result 为统一生成结果。
+// 返回值：具有新 item ID 的输出项。
+private func responses_output_items(_ result: GatewayResult) -> [[String: Any]] {
+    var output: [[String: Any]] = []
+    if !result.text.isEmpty {
+        output.append(responses_text_item(
+            text: result.text,
+            item_id: "msg_" + randomHex(24)))
+    }
+    output.append(contentsOf: result.tool_calls.map(responses_function_call_item))
+    return output
+}
+
+// 功能：构造 completed Responses 文本 message item。
+// 参数：text 为完整文本；item_id 为稳定 item ID。
+// 返回值：文本 message item。
+private func responses_text_item(
+    text: String,
+    item_id: String
+) -> [String: Any] {
+    [
+        "id": item_id,
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [[
+            "type": "output_text",
+            "text": text,
+            "annotations": [],
+        ]],
+    ]
+}
+
+// 功能：编码 OpenAI Responses SSE 的文本、工具和错误事件。
+// 使用方法：先调用 start_events，再写出 delta 和完成事件。
+struct ResponsesStreamEncoder {
+    let response_id: String
+    let model: String
+    private(set) var sequence_number: Int
+    private let created_at: Int
+    private let text_item_id: String
+    private var text_item_started: Bool
+
+    // 功能：创建具有稳定 response 和 text item ID 的编码器。
+    // 参数：response_id 为响应 ID；model 为模型名。
+    // 返回值：初始序号为零的编码器。
+    init(response_id: String, model: String) {
+        self.response_id = response_id
+        self.model = model
+        sequence_number = 0
+        created_at = nowUnix()
+        text_item_id = "msg_" + randomHex(24)
+        text_item_started = false
+    }
+
+    // 功能：编码 response.created 和 response.in_progress。
+    // 参数：无。
+    // 返回值：两个开始事件。
+    mutating func start_events() -> [String] {
+        let response = in_progress_response()
+        return [
+            event(["type": "response.created", "response": response]),
+            event(["type": "response.in_progress", "response": response]),
+        ]
+    }
+
+    // 功能：编码当前文本增量，首次时先建立 item 和 content part。
+    // 参数：delta 为当前新增文本。
+    // 返回值：一个或三个连续 SSE data 记录。
+    mutating func text_delta(_ delta: String) -> String {
+        var events: [String] = []
+        if !text_item_started {
+            events.append(contentsOf: start_text_item_events(output_index: 0))
+        }
+        events.append(event([
+            "type": "response.output_text.delta",
+            "item_id": text_item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "delta": delta,
+            "logprobs": [],
+        ]))
+        return events.joined()
+    }
+
+    // 功能：编码文本 done、item done 和完整 completed response。
+    // 参数：result 为累积完成的统一结果。
+    // 返回值：文本收尾事件。
+    mutating func finish_text(_ result: GatewayResult) -> [String] {
+        var events: [String] = []
+        if !text_item_started {
+            events.append(contentsOf: start_text_item_events(output_index: 0))
+        }
+        let item = responses_text_item(text: result.text, item_id: text_item_id)
+        events.append(contentsOf: finish_text_item_events(
+            text: result.text,
+            item: item,
+            output_index: 0))
+        let response = make_responses_response(
+            result,
+            response_id: response_id,
+            created_at: created_at,
+            output: [item])
+        events.append(event(["type": "response.completed", "response": response]))
+        return events
+    }
+
+    // 功能：编码完整生成的文本和 function_call 输出事件。
+    // 参数：result 为包含工具调用的统一结果。
+    // 返回值：工具参数增量、完成和响应完成事件。
+    mutating func finish_tools(_ result: GatewayResult) -> [String] {
+        var events: [String] = []
+        var output: [[String: Any]] = []
+        if !result.text.isEmpty {
+            let item = responses_text_item(text: result.text, item_id: text_item_id)
+            events.append(contentsOf: start_text_item_events(output_index: 0))
+            events.append(event([
+                "type": "response.output_text.delta",
+                "item_id": text_item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "delta": result.text,
+                "logprobs": [],
+            ]))
+            events.append(contentsOf: finish_text_item_events(
+                text: result.text,
+                item: item,
+                output_index: 0))
+            output.append(item)
+        }
+        for call in result.tool_calls {
+            let output_index = output.count
+            let item_id = "fc_" + randomHex(24)
+            let call_id = call.id ?? "call_" + randomHex(24)
+            let arguments = jsonString(call.arguments)
+            let item = responses_function_call_item(
+                call,
+                item_id: item_id,
+                call_id: call_id,
+                arguments: arguments)
+            var started_item = item
+            started_item["status"] = "in_progress"
+            started_item["arguments"] = ""
+            events.append(event([
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": started_item,
+            ]))
+            events.append(event([
+                "type": "response.function_call_arguments.delta",
+                "item_id": item_id,
+                "output_index": output_index,
+                "delta": arguments,
+            ]))
+            events.append(event([
+                "type": "response.function_call_arguments.done",
+                "item_id": item_id,
+                "output_index": output_index,
+                "arguments": arguments,
+                "name": call.name,
+            ]))
+            events.append(event([
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": item,
+            ]))
+            output.append(item)
+        }
+        let response = make_responses_response(
+            result,
+            response_id: response_id,
+            created_at: created_at,
+            output: output)
+        events.append(event(["type": "response.completed", "response": response]))
+        return events
+    }
+
+    // 功能：编码 SSE header 已写出后的协议内错误。
+    // 参数：error 为统一协议错误。
+    // 返回值：Responses error event。
+    mutating func error_event(_ error: GatewayProtocolError) -> String {
+        event([
+            "type": "error",
+            "code": error.code,
+            "message": error.description,
+            "param": NSNull(),
+        ])
+    }
+
+    // 功能：创建流启动时的 in_progress Response object。
+    // 参数：无。
+    // 返回值：尚无 output 和 usage 的响应对象。
+    private func in_progress_response() -> [String: Any] {
+        [
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "status": "in_progress",
+            "background": false,
+            "error": NSNull(),
+            "incomplete_details": NSNull(),
+            "instructions": NSNull(),
+            "model": model,
+            "output": [],
+            "parallel_tool_calls": true,
+            "previous_response_id": NSNull(),
+            "store": false,
+            "tool_choice": "auto",
+            "tools": [],
+            "usage": NSNull(),
+        ]
+    }
+
+    // 功能：为文本流建立 output message 和空 output_text part。
+    // 参数：output_index 为 Response output 中的位置。
+    // 返回值：output_item.added 和 content_part.added。
+    private mutating func start_text_item_events(
+        output_index: Int
+    ) -> [String] {
+        text_item_started = true
+        return [
+            event([
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": [
+                    "id": text_item_id,
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": [],
+                ],
+            ]),
+            event([
+                "type": "response.content_part.added",
+                "item_id": text_item_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "part": [
+                    "type": "output_text",
+                    "text": "",
+                    "annotations": [],
+                ],
+            ]),
+        ]
+    }
+
+    // 功能：为完整文本编码 text、content part 和 output item 收尾事件。
+    // 参数：text 为完整文本；item 为完成项；output_index 为输出位置。
+    // 返回值：三个收尾事件。
+    private mutating func finish_text_item_events(
+        text: String,
+        item: [String: Any],
+        output_index: Int
+    ) -> [String] {
+        let part: [String: Any] = [
+            "type": "output_text",
+            "text": text,
+            "annotations": [],
+        ]
+        return [
+            event([
+                "type": "response.output_text.done",
+                "item_id": text_item_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "text": text,
+                "logprobs": [],
+            ]),
+            event([
+                "type": "response.content_part.done",
+                "item_id": text_item_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "part": part,
+            ]),
+            event([
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": item,
+            ]),
+        ]
+    }
+
+    // 功能：注入当前 sequence_number 并编码为单条 SSE data 记录。
+    // 参数：object 为待编码事件。
+    // 返回值：以两个换行结尾的 SSE 记录。
+    private mutating func event(_ object: [String: Any]) -> String {
+        var payload = object
+        payload["sequence_number"] = sequence_number
+        sequence_number += 1
+        return "data: \(jsonString(payload))\n\n"
+    }
 }
 
 // 功能：拒绝当前实现无法提供的后台和服务端持久状态能力。
@@ -373,13 +772,29 @@ private func parse_responses_tool_choice(
 private func responses_function_call_item(
     _ call: GatewayToolCall
 ) -> [String: Any] {
+    responses_function_call_item(
+        call,
+        item_id: "fc_" + randomHex(24),
+        call_id: call.id ?? "call_" + randomHex(24),
+        arguments: jsonString(call.arguments))
+}
+
+// 功能：用已分配的 ID 和参数构造 Responses function_call item。
+// 参数：call 为调用；item_id 为项 ID；call_id 为调用 ID；arguments 为 JSON。
+// 返回值：可序列化的 function_call item。
+private func responses_function_call_item(
+    _ call: GatewayToolCall,
+    item_id: String,
+    call_id: String,
+    arguments: String
+) -> [String: Any] {
     [
-        "id": "fc_" + randomHex(24),
+        "id": item_id,
         "type": "function_call",
         "status": "completed",
-        "call_id": call.id ?? "call_" + randomHex(24),
+        "call_id": call_id,
         "name": call.name,
-        "arguments": jsonString(call.arguments),
+        "arguments": arguments,
     ]
 }
 

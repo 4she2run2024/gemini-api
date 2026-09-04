@@ -1,6 +1,6 @@
 import Foundation
 
-// 用途：验证 OpenAI Responses 非流式请求解析和响应对象契约。
+// 用途：验证 OpenAI Responses 请求、响应对象和 SSE 事件契约。
 // 使用方法：由 bash Tests/run-tests.sh --auto 编译并执行。
 
 private final class FakeResponsesGenerator: TextGenerating {
@@ -36,6 +36,11 @@ struct ResponsesProtocolTests {
         test_media_and_builtin_tools_are_unsupported()
         test_text_response_object()
         test_function_call_response_object()
+        try test_text_stream_event_contract()
+        try test_text_stream_delta_is_incremental()
+        try test_tool_stream_event_contract()
+        try test_tool_stream_text_events_have_logprobs()
+        try test_stream_error_event_contract()
         try test_http_route()
         print("ResponsesProtocolTests passed")
     }
@@ -247,6 +252,169 @@ struct ResponsesProtocolTests {
         assert_usage(response)
     }
 
+    // 功能：验证文本 SSE 的类型顺序、连续序号和稳定 ID。
+    // 参数：无。
+    // 返回值：无。
+    private static func test_text_stream_event_contract() throws {
+        var encoder = ResponsesStreamEncoder(
+            response_id: "resp_stream_text",
+            model: "gemini-3.8-flash")
+        var chunks = encoder.start_events()
+        chunks.append(encoder.text_delta("Project summary"))
+        chunks.append(contentsOf: encoder.finish_text(result(text: "Project summary")))
+        let events = try sse_events(chunks)
+        let expected_types = [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.output_item.done",
+            "response.completed",
+        ]
+        precondition(events.compactMap { $0["type"] as? String } == expected_types)
+        precondition(
+            events.compactMap { $0["sequence_number"] as? Int }
+                == Array(0..<expected_types.count))
+        precondition((events[4]["logprobs"] as? [Any])?.isEmpty == true)
+        precondition((events[5]["logprobs"] as? [Any])?.isEmpty == true)
+
+        let response_ids = events.compactMap { event -> String? in
+            let response = event["response"] as? [String: Any]
+            return response?["id"] as? String
+        }
+        precondition(response_ids == Array(repeating: "resp_stream_text", count: 3))
+        let added_item = events[2]["item"] as? [String: Any]
+        let item_id = added_item?["id"] as? String
+        precondition(item_id != nil)
+        precondition(events[3]["item_id"] as? String == item_id)
+        precondition(events[4]["item_id"] as? String == item_id)
+        precondition(events[5]["item_id"] as? String == item_id)
+        precondition(events[6]["item_id"] as? String == item_id)
+        let done_item = events[7]["item"] as? [String: Any]
+        precondition(done_item?["id"] as? String == item_id)
+        let final_response = events[8]["response"] as? [String: Any]
+        let final_output = final_response?["output"] as? [[String: Any]]
+        precondition(final_output?.first?["id"] as? String == item_id)
+        let final_content = final_output?.first?["content"] as? [[String: Any]]
+        precondition(final_content?.first?["text"] as? String == "Project summary")
+    }
+
+    // 功能：验证每个 output_text delta 只携带本次新增文本。
+    // 参数：无。
+    // 返回值：无。
+    private static func test_text_stream_delta_is_incremental() throws {
+        var encoder = ResponsesStreamEncoder(
+            response_id: "resp_incremental",
+            model: "gemini-3.8-flash")
+        var chunks = encoder.start_events()
+        chunks.append(encoder.text_delta("Pro"))
+        chunks.append(encoder.text_delta("ject"))
+        chunks.append(contentsOf: encoder.finish_text(result(text: "Project")))
+        let events = try sse_events(chunks)
+        let deltas = events.filter {
+            $0["type"] as? String == "response.output_text.delta"
+        }
+        precondition(deltas.compactMap { $0["delta"] as? String } == ["Pro", "ject"])
+        let text_events = events.filter {
+            let type = $0["type"] as? String
+            return type == "response.output_text.delta"
+                || type == "response.output_text.done"
+        }
+        precondition(text_events.count == 3)
+        precondition(text_events.allSatisfy {
+            ($0["logprobs"] as? [Any])?.isEmpty == true
+        })
+    }
+
+    // 功能：验证工具 SSE 输出完整参数事件，并复用 item ID。
+    // 参数：无。
+    // 返回值：无。
+    private static func test_tool_stream_event_contract() throws {
+        var encoder = ResponsesStreamEncoder(
+            response_id: "resp_stream_tool",
+            model: "gemini-3.8-flash")
+        let tool_result = result(
+            text: "",
+            calls: [GatewayToolCall(
+                id: "call_read",
+                name: "Read",
+                arguments: ["file_path": "README.md"])])
+        let events = try sse_events(encoder.start_events() + encoder.finish_tools(tool_result))
+        let expected_types = [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+            "response.output_item.done",
+            "response.completed",
+        ]
+        precondition(events.compactMap { $0["type"] as? String } == expected_types)
+        precondition(
+            events.compactMap { $0["sequence_number"] as? Int }
+                == Array(0..<expected_types.count))
+        let added_item = events[2]["item"] as? [String: Any]
+        let item_id = added_item?["id"] as? String
+        precondition(item_id != nil)
+        precondition(events[3]["item_id"] as? String == item_id)
+        precondition(events[4]["item_id"] as? String == item_id)
+        let done_item = events[5]["item"] as? [String: Any]
+        precondition(done_item?["id"] as? String == item_id)
+        let final_response = events[6]["response"] as? [String: Any]
+        let final_output = final_response?["output"] as? [[String: Any]]
+        precondition(final_output?.first?["id"] as? String == item_id)
+        precondition(events[3]["delta"] as? String == "{\"file_path\":\"README.md\"}")
+        precondition(events[4]["arguments"] as? String == "{\"file_path\":\"README.md\"}")
+    }
+
+    // 功能：验证完整生成的工具流中，文本 delta 和 done 均带空 logprobs。
+    // 参数：无。
+    // 返回值：无。
+    private static func test_tool_stream_text_events_have_logprobs() throws {
+        var encoder = ResponsesStreamEncoder(
+            response_id: "resp_tool_text",
+            model: "gemini-3.8-flash")
+        let tool_result = result(
+            text: "Inspecting",
+            calls: [GatewayToolCall(
+                id: "call_read",
+                name: "Read",
+                arguments: ["file_path": "README.md"])])
+        let events = try sse_events(encoder.start_events() + encoder.finish_tools(tool_result))
+        let text_events = events.filter {
+            let type = $0["type"] as? String
+            return type == "response.output_text.delta"
+                || type == "response.output_text.done"
+        }
+        precondition(text_events.count == 2)
+        precondition(text_events.allSatisfy {
+            ($0["logprobs"] as? [Any])?.isEmpty == true
+        })
+    }
+
+    // 功能：验证 header 后错误编码为协议内 error event。
+    // 参数：无。
+    // 返回值：无。
+    private static func test_stream_error_event_contract() throws {
+        var encoder = ResponsesStreamEncoder(
+            response_id: "resp_stream_error",
+            model: "gemini-3.8-flash")
+        let events = try sse_events(
+            encoder.start_events() + [encoder.error_event(.upstream("connection lost"))])
+        precondition(events.map { $0["type"] as? String } == [
+            "response.created",
+            "response.in_progress",
+            "error",
+        ])
+        precondition(events[2]["code"] as? String == "upstream_error")
+        precondition(events[2]["message"] as? String == "connection lost")
+        precondition(events[2]["param"] is NSNull)
+        precondition(events[2]["sequence_number"] as? Int == 2)
+    }
+
     // 功能：验证 POST /v1/responses 命中新 handler 并返回 completed object。
     // 参数：无。
     // 返回值：无。
@@ -328,5 +496,24 @@ struct ResponsesProtocolTests {
         precondition(usage?["input_tokens"] as? Int == 8)
         precondition(usage?["output_tokens"] as? Int == 5)
         precondition(usage?["total_tokens"] as? Int == 13)
+    }
+
+    // 功能：解析一组可能合并写出的 Responses SSE data 事件。
+    // 参数：chunks 为 encoder 返回的 SSE 字符串。
+    // 返回值：按网络顺序解析的 JSON 对象。
+    private static func sse_events(
+        _ chunks: [String]
+    ) throws -> [[String: Any]] {
+        try chunks.flatMap { chunk in
+            try chunk.components(separatedBy: "\n\n").compactMap { record in
+                guard record.hasPrefix("data: ") else { return nil }
+                let data = Data(record.dropFirst(6).utf8)
+                guard let object = try JSONSerialization.jsonObject(with: data)
+                        as? [String: Any] else {
+                    preconditionFailure("SSE data is not a JSON object")
+                }
+                return object
+            }
+        }
     }
 }

@@ -1,4 +1,4 @@
-// 用途：验证现有 OpenAI 与 Anthropic HTTP endpoint 的共享管线回归行为。
+// 用途：验证 OpenAI、Responses 与 Anthropic HTTP endpoint 的共享管线。
 // 使用方法：由 bash Tests/run-tests.sh --auto 编译并执行。
 
 import Foundation
@@ -9,6 +9,7 @@ private final class FakeGenerator: TextGenerating {
     private(set) var stream_started = DispatchSemaphore(value: 0)
     private(set) var stream_finished = DispatchSemaphore(value: 0)
     private var wait_for_cancellation = false
+    private var fail_stream = false
 
     func generate(_ request: GenerationRequest) throws -> String {
         last_prompt = request.prompt
@@ -38,6 +39,12 @@ private final class FakeGenerator: TextGenerating {
             }
             return
         }
+        if fail_stream {
+            throw NSError(
+                domain: "HTTPServerIntegrationTests",
+                code: 9,
+                userInfo: [NSLocalizedDescriptionKey: "stream failed"])
+        }
         onDelta("fake stream")
     }
 
@@ -56,6 +63,13 @@ private final class FakeGenerator: TextGenerating {
     // 返回值：无。
     func finish_cancellation_test() {
         wait_for_cancellation = false
+    }
+
+    // 功能：控制下一个文本流在启动后失败。
+    // 参数：should_fail 为是否抛出流式错误。
+    // 返回值：无。
+    func set_stream_failure(_ should_fail: Bool) {
+        fail_stream = should_fail
     }
 }
 
@@ -92,6 +106,10 @@ struct HTTPServerIntegrationTests {
         try test_named_tool_choices_are_normalized()
         try test_openai_malformed_tool_history_returns_400()
         try test_anthropic_stream_propagates_cancellation(fake)
+        try test_responses_text_stream()
+        try test_responses_tool_stream()
+        try test_responses_stream_error(fake)
+        try test_responses_stream_propagates_cancellation(fake)
         try testTokenCount()
         try testInvalidToolChoices()
         print("HTTPServerIntegrationTests passed")
@@ -406,6 +424,116 @@ struct HTTPServerIntegrationTests {
         precondition(fake.cancellation_observed)
     }
 
+    // 功能：验证 stream:true 的 Responses 文本请求返回完整 SSE 顺序。
+    // 参数：无。
+    // 返回值：无。
+    private static func test_responses_text_stream() throws {
+        let result = try post(
+            path: "/v1/responses",
+            payload: [
+                "model": "gemini-3.6-flash",
+                "stream": true,
+                "input": "Summarize",
+            ])
+        precondition(result.status == 200)
+        let events = try sse_events(result.data)
+        precondition(events.map { $0["type"] as? String } == [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.output_item.done",
+            "response.completed",
+        ])
+        precondition(events[4]["delta"] as? String == "fake stream")
+        let final_response = events.last?["response"] as? [String: Any]
+        let output = final_response?["output"] as? [[String: Any]]
+        let content = output?.first?["content"] as? [[String: Any]]
+        precondition(content?.first?["text"] as? String == "fake stream")
+    }
+
+    // 功能：验证有活动工具的 Responses 流使用完整生成结果。
+    // 参数：无。
+    // 返回值：无。
+    private static func test_responses_tool_stream() throws {
+        let result = try post(
+            path: "/v1/responses",
+            payload: [
+                "model": "gemini-3.6-flash",
+                "stream": true,
+                "input": "Read README.md",
+                "tools": [[
+                    "type": "function",
+                    "name": "Read",
+                    "description": "Read a file",
+                    "parameters": ["type": "object"],
+                ]],
+            ])
+        precondition(result.status == 200)
+        let events = try sse_events(result.data)
+        let types = events.compactMap { $0["type"] as? String }
+        precondition(types.contains("response.function_call_arguments.delta"))
+        precondition(types.contains("response.function_call_arguments.done"))
+        precondition(types.last == "response.completed")
+        let final_response = events.last?["response"] as? [String: Any]
+        let output = final_response?["output"] as? [[String: Any]]
+        precondition(output?.first?["type"] as? String == "function_call")
+        precondition(output?.first?["name"] as? String == "Read")
+    }
+
+    // 功能：验证 SSE header 后的 Responses 上游失败只产生 error event。
+    // 参数：fake 为可控生成器。
+    // 返回值：无。
+    private static func test_responses_stream_error(_ fake: FakeGenerator) throws {
+        fake.set_stream_failure(true)
+        defer { fake.set_stream_failure(false) }
+        let result = try post(
+            path: "/v1/responses",
+            payload: ["stream": true, "input": "Fail after header"])
+        precondition(result.status == 200)
+        let events = try sse_events(result.data)
+        precondition(events.map { $0["type"] as? String } == [
+            "response.created",
+            "response.in_progress",
+            "error",
+        ])
+        precondition(events.last?["code"] as? String == "upstream_error")
+        precondition(!result.text.contains("response.output_text.delta"))
+        precondition(!result.text.contains("response.completed"))
+    }
+
+    // 功能：验证 Responses 文本流把客户端断开传播给共享生成器。
+    // 参数：fake 为可控生成器。
+    // 返回值：无。
+    private static func test_responses_stream_propagates_cancellation(
+        _ fake: FakeGenerator
+    ) throws {
+        fake.prepare_cancellation_test()
+        defer { fake.finish_cancellation_test() }
+        let url = URL(string: "http://127.0.0.1:\(testPort)/v1/responses")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = requestTimeoutSeconds
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "stream": true,
+            "input": "wait",
+        ])
+        let task = URLSession.shared.dataTask(with: request)
+        task.resume()
+        precondition(
+            fake.stream_started.wait(timeout: .now() + 2) == .success,
+            "Responses stream did not start")
+        task.cancel()
+        precondition(
+            fake.stream_finished.wait(timeout: .now() + 2) == .success,
+            "Responses stream did not finish after cancellation")
+        precondition(fake.cancellation_observed)
+    }
+
     private static func testTokenCount() throws {
         let result = try post(
             path: "/v1/messages/count_tokens",
@@ -482,5 +610,22 @@ struct HTTPServerIntegrationTests {
                           userInfo: [NSLocalizedDescriptionKey: "response is not a JSON object"])
         }
         return object
+    }
+
+    // 功能：按 data 记录解析 Responses SSE JSON 事件。
+    // 参数：data 为 HTTP 响应体。
+    // 返回值：按网络顺序排列的事件对象。
+    private static func sse_events(_ data: Data) throws -> [[String: Any]] {
+        try String(decoding: data, as: UTF8.self)
+            .components(separatedBy: "\n\n")
+            .compactMap { record in
+                guard record.hasPrefix("data: ") else { return nil }
+                let payload = Data(record.dropFirst(6).utf8)
+                guard let object = try JSONSerialization.jsonObject(with: payload)
+                        as? [String: Any] else {
+                    preconditionFailure("SSE data is not a JSON object")
+                }
+                return object
+            }
     }
 }

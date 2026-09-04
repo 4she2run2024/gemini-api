@@ -1,15 +1,37 @@
+// 用途：验证协议 prompt、工具续轮、工具策略与 Anthropic 响应编码。
+// 使用方法：由 bash Tests/run-tests.sh --auto 编译并执行。
+
 import Foundation
 
 @main
 struct StreamRoutingTests {
     static func main() throws {
         testToolActivation()
+        test_developer_role_prompt()
         try testAnthropicPromptRoundTrip()
         try testStructuredToolParsing()
         testMalformedCallsAreVisible()
         try testToolChoiceEnforcement()
         try testAnthropicResponse()
         print("StreamRoutingTests passed")
+    }
+
+    // 功能：验证共享 prompt 为 developer 角色保留独立指令标签。
+    // 参数：无。
+    // 返回值：无。
+    private static func test_developer_role_prompt() {
+        let request = GatewayRequest(
+            model: "gemini-3.6-flash",
+            messages: [
+                GatewayMessage(
+                    role: .developer,
+                    content: [.text("Inspect before answering.")]),
+            ],
+            tools: [],
+            tool_choice: .none,
+            stream: false)
+        let prompt = gateway_prompt(request)
+        precondition(prompt.contains("[Developer instruction]"))
     }
 
     private static func testToolActivation() {
@@ -34,6 +56,7 @@ struct StreamRoutingTests {
                 ]]],
                 ["role": "user", "content": [[
                     "type": "tool_result", "tool_use_id": "toolu_existing",
+                    "is_error": true,
                     "content": [["type": "text", "text": "Gemini Free"]],
                 ]]],
             ],
@@ -43,6 +66,8 @@ struct StreamRoutingTests {
         precondition(prompt.contains("\"file_path\""))
         precondition(prompt.contains("\"name\":\"Read\""))
         precondition(prompt.contains("Tool result for Read"))
+        precondition(prompt.contains("id=toolu_existing"))
+        precondition(prompt.contains("status=error"))
         precondition(prompt.contains("Gemini Free"))
     }
 
@@ -118,7 +143,11 @@ struct StreamRoutingTests {
     }
 
     private static func testAnthropicResponse() throws {
-        let raw = "```tool_call\n{\"name\":\"Read\",\"arguments\":{\"file_path\":\"README.md\"}}\n```"
+        let raw = """
+        ```tool_call
+        {"name":"Read","arguments":{"file_path":"README.md"}}
+        ```
+        """
         let output = try parseStructuredToolCalls(raw, allowedToolNames: ["Read"])
         let message = makeAnthropicMessage(AnthropicMessageBuildInput(
             model: "gemini-3.6-flash", prompt: "prompt", rawOutput: raw, output: output))

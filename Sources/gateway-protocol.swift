@@ -21,6 +21,23 @@ struct GatewayToolResult {
     let call_id: String?
     let name: String?
     let output: Any
+    let is_error: Bool?
+
+    // 功能：创建协议无关工具结果，并可选保留错误状态。
+    // 参数：call_id 为调用 ID；name 为工具名；output 为结果；
+    // is_error 为错误状态。
+    // 返回值：初始化后的工具结果。
+    init(
+        call_id: String?,
+        name: String?,
+        output: Any,
+        is_error: Bool? = nil
+    ) {
+        self.call_id = call_id
+        self.name = name
+        self.output = output
+        self.is_error = is_error
+    }
 }
 
 enum GatewayContent {

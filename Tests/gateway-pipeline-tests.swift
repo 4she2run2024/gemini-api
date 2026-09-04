@@ -63,7 +63,7 @@ struct GatewayPipelineTests {
         precondition(prompt.contains("[User]"))
         precondition(prompt.contains("[Assistant]"))
         precondition(prompt.contains("\"name\":\"Read\""))
-        precondition(prompt.contains("[Tool result for Read]"))
+        precondition(prompt.contains("[Tool result for Read; id=call_read; status=error]"))
         precondition(prompt.contains("Gemini2API"))
     }
 
@@ -213,7 +213,8 @@ struct GatewayPipelineTests {
                     .tool_result(GatewayToolResult(
                         call_id: "call_read",
                         name: "Read",
-                        output: "Gemini2API")),
+                        output: "Gemini2API",
+                        is_error: true)),
                 ]),
             ],
             tools: [read_tool],

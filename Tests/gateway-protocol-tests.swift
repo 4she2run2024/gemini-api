@@ -18,6 +18,13 @@ struct GatewayProtocolTests {
 
         let usage = GatewayUsage(input_tokens: 8, output_tokens: 5)
         precondition(usage.total_tokens == 13)
+
+        let tool_result = GatewayToolResult(
+            call_id: "toolu_123",
+            name: "Read",
+            output: "permission denied",
+            is_error: true)
+        precondition(tool_result.is_error == true)
         print("GatewayProtocolTests passed")
     }
 }

@@ -6,6 +6,7 @@ import Darwin
 import Foundation
 
 private enum DaemonLoggerTestError: Error {
+    case expected_failure
     case invalid_arguments
     case recycle_failed
 }
@@ -20,6 +21,51 @@ private enum SensitiveEngineError: Error, CustomStringConvertible {
 
 private let LOG_NAME = "gemini2api.log"
 private let ARCHIVE_NAME = "archive"
+
+private final class ScriptedSystemCalls {
+    private let state_lock = NSLock()
+    private let failing_replace_calls: Set<Int>
+    private let force_swap_failure: Bool
+    private var replace_count = 0
+
+    // 功能：构造按调用序号失败的真实 syscall 包装器。
+    // 参数：failing_replace_calls 为失败序号；force_swap_failure 控制交换失败。
+    // 返回值：初始化后的包装器。
+    init(failing_replace_calls: Set<Int>, force_swap_failure: Bool) {
+        self.failing_replace_calls = failing_replace_calls
+        self.force_swap_failure = force_swap_failure
+    }
+
+    // 功能：除指定序号外执行真实 dup2。
+    // 参数：source 和 destination 为 fd。
+    // 返回值：真实结果或注入的 -1。
+    func replace_descriptor(_ source: Int32, _ destination: Int32) -> Int32 {
+        state_lock.lock()
+        replace_count += 1
+        let current_count = replace_count
+        state_lock.unlock()
+        if failing_replace_calls.contains(current_count) {
+            errno = EIO
+            return -1
+        }
+        return Darwin.dup2(source, destination)
+    }
+
+    // 功能：执行真实 RENAME_SWAP 或注入稳定失败。
+    // 参数：canonical_path 和 staging_path 为交换路径。
+    // 返回值：真实结果或注入的 -1。
+    func swap_paths(_ canonical_path: String, _ staging_path: String) -> Int32 {
+        if force_swap_failure {
+            errno = EIO
+            return -1
+        }
+        return canonical_path.withCString { canonical_pointer in
+            staging_path.withCString { staging_pointer in
+                renamex_np(canonical_pointer, staging_pointer, UInt32(RENAME_SWAP))
+            }
+        }
+    }
+}
 
 @main
 struct DaemonLoggerTests {
@@ -43,7 +89,10 @@ struct DaemonLoggerTests {
         try test_below_threshold_does_not_rotate(test_root: test_root)
         try test_rotation_switches_fds_before_recycling(test_root: test_root)
         try test_recycle_failure_keeps_current_log_writable(test_root: test_root)
+        try test_trash_callback_can_reenter_logger(test_root: test_root)
+        try test_partial_dup2_rollback_preserves_each_stream(test_root: test_root)
         try test_rotation_monitor_start_and_stop_are_idempotent(test_root: test_root)
+        try test_stop_waits_for_in_flight_monitor(test_root: test_root)
         try test_engine_retry_log_excludes_error_description()
         try assert_secret_fixtures_absent_in_files(test_root: test_root)
         print("DaemonLoggerTests passed")
@@ -128,6 +177,43 @@ struct DaemonLoggerTests {
         precondition(old_data == Data(repeating: 0x6f, count: 8))
     }
 
+    // 功能：验证 Trash 回调可重入 write、stop 和 rotate，不被 logger 锁阻塞。
+    // 参数：test_root 为隔离测试根。
+    // 返回值：无；helper 超时或归档失败时终止测试。
+    private static func test_trash_callback_can_reenter_logger(
+        test_root: URL
+    ) throws {
+        let root = test_root.appendingPathComponent("reentrant-trash")
+        try run_helper(mode: "reentrant-trash", root: root, timeout_seconds: 2)
+        let current = try String(contentsOf: log_url(root), encoding: .utf8)
+        let archives = try archived_files(root)
+        precondition(current.contains("event=daemon_ready"))
+        precondition(archives.count == 1)
+    }
+
+    // 功能：验证 stdout/stderr 各自回滚失败时仍有可写路径且不回收该路径。
+    // 参数：test_root 为隔离测试根。
+    // 返回值：无；fd 失效、路径被回收或错误不稳定时终止测试。
+    private static func test_partial_dup2_rollback_preserves_each_stream(
+        test_root: URL
+    ) throws {
+        for mode in ["rollback-stdout", "rollback-stderr"] {
+            let root = test_root.appendingPathComponent(mode)
+            try run_helper(mode: mode, root: root)
+            let current = try String(contentsOf: log_url(root), encoding: .utf8)
+            let siblings = try log_siblings(root)
+            let archives = try archived_files(root)
+            precondition(siblings.count == 1)
+            precondition(archives.isEmpty)
+            let staging = try String(contentsOf: siblings[0], encoding: .utf8)
+            let combined = current + staging
+            precondition(combined.contains("stdout-viable\n"))
+            precondition(combined.contains("stderr-viable\n"))
+            precondition(combined.contains("error_category=descriptor_rollback_failed"))
+            precondition(!combined.contains(root.path))
+        }
+    }
+
     // 功能：验证 monitor 重复启动不会泄漏 timer，
     // 且重复 stop 安全并真正停止检查。
     // 参数：test_root 为隔离测试根。
@@ -137,6 +223,20 @@ struct DaemonLoggerTests {
     ) throws {
         let root = test_root.appendingPathComponent("timer")
         try run_helper(mode: "timer", root: root)
+        let archives = try archived_files(root)
+        let current_data = try Data(contentsOf: log_url(root))
+        precondition(archives.count == 1)
+        precondition(current_data.count == 8)
+    }
+
+    // 功能：验证 stop 等待已进入的 timer handler，返回后不再发生轮转。
+    // 参数：test_root 为隔离测试根。
+    // 返回值：无；stop 提前返回或返回后仍轮转时终止测试。
+    private static func test_stop_waits_for_in_flight_monitor(
+        test_root: URL
+    ) throws {
+        let root = test_root.appendingPathComponent("stop-barrier")
+        try run_helper(mode: "stop-barrier", root: root)
         let archives = try archived_files(root)
         let current_data = try Data(contentsOf: log_url(root))
         precondition(archives.count == 1)
@@ -161,15 +261,26 @@ struct DaemonLoggerTests {
     // 功能：启动当前测试二进制的 helper 子进程，隔离 stdio fd 修改。
     // 参数：mode 为 helper 场景；root 为该场景夹具根。
     // 返回值：子进程退出零时返回，否则终止测试。
-    private static func run_helper(mode: String, root: URL) throws {
+    private static func run_helper(
+        mode: String,
+        root: URL,
+        timeout_seconds: Double = 10
+    ) throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
         process.arguments = ["--daemon-logger-helper", mode, root.path]
         let output = Pipe()
         process.standardOutput = output
         process.standardError = output
+        let completed = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in completed.signal() }
         try process.run()
-        process.waitUntilExit()
+        let wait_result = completed.wait(timeout: .now() + timeout_seconds)
+        if wait_result == .timedOut {
+            process.terminate()
+            process.waitUntilExit()
+            preconditionFailure("helper timeout: \(mode)")
+        }
         precondition(process.terminationStatus == 0)
     }
 
@@ -220,6 +331,29 @@ struct DaemonLoggerTests {
             try logger.rotate_if_needed()
             try write_fd(STDERR_FILENO, text: "after-failed-trash\n")
             logger.stop()
+        case "reentrant-trash":
+            try seed_log(log_url, count: 8)
+            var logger: DaemonLogger!
+            logger = DaemonLogger(log_url: log_url, maximum_bytes: 8) { old_url in
+                try logger.rotate_if_needed()
+                logger.write(.info, event: "daemon_ready", fields: [:])
+                logger.stop()
+                try archive(old_url, in: archive_directory)
+            }
+            try logger.redirect_standard_streams()
+            try logger.rotate_if_needed()
+        case "rollback-stdout":
+            try run_rollback_helper(
+                log_url: log_url,
+                archive_directory: archive_directory,
+                failing_replace_calls: [4, 5],
+                force_swap_failure: false)
+        case "rollback-stderr":
+            try run_rollback_helper(
+                log_url: log_url,
+                archive_directory: archive_directory,
+                failing_replace_calls: [6],
+                force_swap_failure: true)
         case "timer":
             try seed_log(log_url, count: 8)
             let logger = make_logger(log_url: log_url, maximum_bytes: 8,
@@ -232,6 +366,10 @@ struct DaemonLoggerTests {
             logger.stop()
             try write_fd(STDOUT_FILENO, bytes: Data(repeating: 0x6e, count: 8))
             Thread.sleep(forTimeInterval: 1.4)
+        case "stop-barrier":
+            try run_stop_barrier_helper(
+                log_url: log_url,
+                archive_directory: archive_directory)
         default:
             throw DaemonLoggerTestError.invalid_arguments
         }
@@ -258,7 +396,91 @@ struct DaemonLoggerTests {
         logger.write(.error, event: "unknown-event", fields: [
             "error_category": "unknown-event-secret-fixture",
         ])
+        let allowed_events = [
+            "daemon_starting", "daemon_ready", "request_completed", "request_retry",
+            "daemon_error", "rotation_error", "daemon_stopping",
+        ]
+        let accepted_fields = [
+            "stage", "host", "port", "pid", "http_status", "error_category",
+            "retry_count",
+        ]
+        for event in allowed_events {
+            for field in accepted_fields {
+                for secret in secret_fixtures() {
+                    logger.write(.error, event: event, fields: [field: secret])
+                }
+            }
+        }
+        for secret in secret_fixtures() {
+            logger.write(.error, event: secret, fields: ["error_category": "none"])
+        }
         logger.stop()
+    }
+
+    // 功能：注入 fd/交换失败并验证 rotate 抛错后两个标准流仍可写。
+    // 参数：log_url 为日志；archive_directory 为归档区；其余参数控制失败点。
+    // 返回值：无；rotate 未抛错或 fd 写入失败时抛错。
+    private static func run_rollback_helper(
+        log_url: URL,
+        archive_directory: URL,
+        failing_replace_calls: Set<Int>,
+        force_swap_failure: Bool
+    ) throws {
+        try seed_log(log_url, count: 8)
+        let script = ScriptedSystemCalls(
+            failing_replace_calls: failing_replace_calls,
+            force_swap_failure: force_swap_failure)
+        let system_calls = DaemonLoggerSystemCalls(
+            replace_descriptor: script.replace_descriptor,
+            swap_paths: script.swap_paths)
+        let logger = DaemonLogger(
+            log_url: log_url,
+            maximum_bytes: 8,
+            trash_item: { old_url in try archive(old_url, in: archive_directory) },
+            system_calls: system_calls)
+        try logger.redirect_standard_streams()
+        do {
+            try logger.rotate_if_needed()
+            throw DaemonLoggerTestError.expected_failure
+        } catch DaemonLoggerTestError.expected_failure {
+            throw DaemonLoggerTestError.expected_failure
+        } catch {
+            try write_fd(STDOUT_FILENO, text: "stdout-viable\n")
+            try write_fd(STDERR_FILENO, text: "stderr-viable\n")
+        }
+        logger.stop()
+    }
+
+    // 功能：阻塞 timer 的 Trash 回调并验证 stop 是完整 handler 生命周期屏障。
+    // 参数：log_url 为日志；archive_directory 为归档区。
+    // 返回值：无；同步超时或 stop 后再次轮转时终止 helper。
+    private static func run_stop_barrier_helper(
+        log_url: URL,
+        archive_directory: URL
+    ) throws {
+        try seed_log(log_url, count: 8)
+        let trash_entered = DispatchSemaphore(value: 0)
+        let release_trash = DispatchSemaphore(value: 0)
+        let logger = DaemonLogger(log_url: log_url, maximum_bytes: 8) { old_url in
+            trash_entered.signal()
+            precondition(release_trash.wait(timeout: .now() + 5) == .success)
+            try archive(old_url, in: archive_directory)
+        }
+        try logger.redirect_standard_streams()
+        logger.start_rotation_monitor()
+        precondition(trash_entered.wait(timeout: .now() + 3) == .success)
+
+        let stop_returned = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            logger.stop()
+            stop_returned.signal()
+        }
+        precondition(stop_returned.wait(timeout: .now() + 0.2) == .timedOut)
+        release_trash.signal()
+        precondition(stop_returned.wait(timeout: .now() + 3) == .success)
+
+        try write_fd(STDOUT_FILENO, bytes: Data(repeating: 0x6e, count: 8))
+        Thread.sleep(forTimeInterval: 1.4)
     }
 
     // 功能：构造把旧日志移动至夹具归档区的 logger。

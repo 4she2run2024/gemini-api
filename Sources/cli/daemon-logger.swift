@@ -14,9 +14,44 @@ enum DaemonLogLevel: String {
 }
 
 private enum DaemonLoggerError: Error {
+    case descriptor_rollback_failed
     case invalid_log_directory
     case invalid_log_file
     case system_call_failed
+}
+
+struct DaemonLoggerSystemCalls {
+    let replace_descriptor: (Int32, Int32) -> Int32
+    let swap_paths: (String, String) -> Int32
+
+    // 功能：构造可测试的 fd 替换与路径交换边界。
+    // 参数：replace_descriptor 包装 dup2；swap_paths 包装 RENAME_SWAP。
+    // 返回值：初始化后的 syscall 集合。
+    init(
+        replace_descriptor: @escaping (Int32, Int32) -> Int32,
+        swap_paths: @escaping (String, String) -> Int32
+    ) {
+        self.replace_descriptor = replace_descriptor
+        self.swap_paths = swap_paths
+    }
+
+    // 功能：提供生产环境真实 Darwin syscall。
+    // 参数：无。
+    // 返回值：真实 syscall 集合。
+    static func live() -> DaemonLoggerSystemCalls {
+        DaemonLoggerSystemCalls(
+            replace_descriptor: { Darwin.dup2($0, $1) },
+            swap_paths: { canonical_path, staging_path in
+                canonical_path.withCString { canonical_pointer in
+                    staging_path.withCString { staging_pointer in
+                        renamex_np(
+                            canonical_pointer,
+                            staging_pointer,
+                            UInt32(RENAME_SWAP))
+                    }
+                }
+            })
+    }
 }
 
 final class DaemonLogger {
@@ -27,6 +62,11 @@ final class DaemonLogger {
     private static let allowed_stages: Set<String> = [
         "startup", "listening", "request", "retry", "rotation", "shutdown",
     ]
+    private static let allowed_error_categories: Set<String> = [
+        "none", "invalid_log_directory", "invalid_log_file", "system_call_failed",
+        "rename_swap_failed", "descriptor_rollback_failed", "trash_failed",
+        "rotation_failed",
+    ]
     private static let ordered_field_names = [
         "stage", "host", "port", "pid", "http_status", "error_category", "retry_count",
     ]
@@ -34,22 +74,47 @@ final class DaemonLogger {
     private let log_url: URL
     private let maximum_bytes: UInt64
     private let trash_item: (URL) throws -> Void
+    private let system_calls: DaemonLoggerSystemCalls
     private let state_lock = NSLock()
+    private let monitor_group = DispatchGroup()
+    private let rotation_queue: DispatchQueue
+    private let rotation_queue_key = DispatchSpecificKey<UInt8>()
     private var rotation_timer: DispatchSourceTimer?
+    private var monitor_generation: UInt64 = 0
+    private var is_stopping = false
 
     // 功能：构造使用动态日志路径、大小阈值和可恢复回收器的
     // daemon logger。
     // 参数：log_url 为 RuntimePaths.log_path；maximum_bytes 为轮转阈值；
     // trash_item 把旧日志移入废纸篓。
     // 返回值：初始化后的 logger。
-    init(
+    convenience init(
         log_url: URL,
         maximum_bytes: UInt64 = 5 * 1024 * 1024,
         trash_item: @escaping (URL) throws -> Void
     ) {
+        self.init(
+            log_url: log_url,
+            maximum_bytes: maximum_bytes,
+            trash_item: trash_item,
+            system_calls: .live())
+    }
+
+    // 功能：构造注入 syscall 的 logger，供确定性失败测试使用。
+    // 参数：前三项与生产 initializer 相同；system_calls 为 syscall 集合。
+    // 返回值：初始化后的 logger。
+    init(
+        log_url: URL,
+        maximum_bytes: UInt64,
+        trash_item: @escaping (URL) throws -> Void,
+        system_calls: DaemonLoggerSystemCalls
+    ) {
         self.log_url = log_url
         self.maximum_bytes = maximum_bytes
         self.trash_item = trash_item
+        self.system_calls = system_calls
+        rotation_queue = DispatchQueue(label: "gemini2api.daemon-log-rotation")
+        rotation_queue.setSpecific(key: rotation_queue_key, value: 1)
     }
 
     // 功能：以 0700/0600 创建日志位置，并把 stdout/stderr 原子指向日志 fd。
@@ -74,11 +139,18 @@ final class DaemonLogger {
             _ = Darwin.close(saved_stderr)
         }
 
-        guard Darwin.dup2(descriptor, STDOUT_FILENO) >= 0 else {
+        guard system_calls.replace_descriptor(descriptor, STDOUT_FILENO) >= 0 else {
             throw DaemonLoggerError.system_call_failed
         }
-        guard Darwin.dup2(descriptor, STDERR_FILENO) >= 0 else {
-            _ = Darwin.dup2(saved_stdout, STDOUT_FILENO)
+        guard system_calls.replace_descriptor(descriptor, STDERR_FILENO) >= 0 else {
+            let restored = restore_standard_streams(
+                saved_stdout: saved_stdout,
+                saved_stderr: saved_stderr,
+                restore_stdout: true,
+                restore_stderr: false)
+            if !restored {
+                throw DaemonLoggerError.descriptor_rollback_failed
+            }
             throw DaemonLoggerError.system_call_failed
         }
     }
@@ -89,23 +161,16 @@ final class DaemonLogger {
     func start_rotation_monitor() {
         state_lock.lock()
         defer { state_lock.unlock() }
-        guard rotation_timer == nil else { return }
+        guard rotation_timer == nil, !is_stopping else { return }
 
-        let timer = DispatchSource.makeTimerSource(
-            queue: DispatchQueue(label: "gemini2api.daemon-log-rotation"))
+        monitor_generation &+= 1
+        let generation = monitor_generation
+        let timer = DispatchSource.makeTimerSource(queue: rotation_queue)
         timer.schedule(
             deadline: .now() + ROTATION_INTERVAL_SECONDS,
             repeating: ROTATION_INTERVAL_SECONDS)
         timer.setEventHandler { [weak self] in
-            guard let self else { return }
-            do {
-                try self.rotate_if_needed()
-            } catch {
-                self.write(
-                    .error,
-                    event: "rotation_error",
-                    fields: ["error_category": self.error_category(error)])
-            }
+            self?.run_rotation_monitor(generation: generation)
         }
         rotation_timer = timer
         timer.resume()
@@ -125,71 +190,114 @@ final class DaemonLogger {
     // 返回值：无；准备或交换失败时恢复旧 fd 并抛错；
     // Trash 失败不影响新日志。
     func rotate_if_needed() throws {
-        state_lock.lock()
-        defer { state_lock.unlock() }
+        var staging_to_recycle: URL?
+        var old_log_to_trash: URL?
+        var operation_error: Error?
 
+        state_lock.lock()
+        do {
+            old_log_to_trash = try rotate_locked(
+                staging_to_recycle: &staging_to_recycle)
+        } catch {
+            operation_error = error
+        }
+        state_lock.unlock()
+
+        if let old_log_to_trash {
+            do {
+                try trash_item(old_log_to_trash)
+            } catch {
+                write(
+                    .error,
+                    event: "rotation_error",
+                    fields: ["error_category": "trash_failed"])
+            }
+        } else if let staging_to_recycle {
+            try? trash_item(staging_to_recycle)
+        }
+        if let operation_error { throw operation_error }
+    }
+
+    // 功能：在持锁状态下完成阈值检查、fd 切换和路径交换。
+    // 参数：staging_to_recycle 返回失败时可在解锁后回收的 staging。
+    // 返回值：成功轮转后的旧日志路径；无需轮转时返回 nil。
+    private func rotate_locked(
+        staging_to_recycle: inout URL?
+    ) throws -> URL? {
         var current_status = stat()
         guard lstat(log_url.path, &current_status) == 0,
               current_status.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
               current_status.st_size >= 0 else {
             throw DaemonLoggerError.invalid_log_file
         }
-        guard UInt64(current_status.st_size) >= maximum_bytes else { return }
+        guard UInt64(current_status.st_size) >= maximum_bytes else { return nil }
 
         let staging_url = log_url.deletingLastPathComponent().appendingPathComponent(
             ".\(log_url.lastPathComponent).\(UUID().uuidString).staging")
         let staging_descriptor = try open_secure_log(staging_url, exclusive: true)
+        staging_to_recycle = staging_url
         let saved_stdout = Darwin.dup(STDOUT_FILENO)
         guard saved_stdout >= 0 else {
             _ = Darwin.close(staging_descriptor)
-            recycle_best_effort(staging_url)
             throw DaemonLoggerError.system_call_failed
         }
         let saved_stderr = Darwin.dup(STDERR_FILENO)
         guard saved_stderr >= 0 else {
             _ = Darwin.close(saved_stdout)
             _ = Darwin.close(staging_descriptor)
-            recycle_best_effort(staging_url)
             throw DaemonLoggerError.system_call_failed
         }
 
-        guard Darwin.dup2(staging_descriptor, STDOUT_FILENO) >= 0 else {
+        guard system_calls.replace_descriptor(
+            staging_descriptor,
+            STDOUT_FILENO) >= 0 else {
             close_rotation_descriptors(staging_descriptor, saved_stdout, saved_stderr)
-            recycle_best_effort(staging_url)
             throw DaemonLoggerError.system_call_failed
         }
-        guard Darwin.dup2(staging_descriptor, STDERR_FILENO) >= 0 else {
-            restore_standard_streams(saved_stdout: saved_stdout, saved_stderr: saved_stderr)
-            close_rotation_descriptors(staging_descriptor, saved_stdout, saved_stderr)
-            recycle_best_effort(staging_url)
-            throw DaemonLoggerError.system_call_failed
-        }
-
-        let swap_result = log_url.path.withCString { canonical_path in
-            staging_url.path.withCString { staging_path in
-                renamex_np(canonical_path, staging_path, UInt32(RENAME_SWAP))
+        guard system_calls.replace_descriptor(
+            staging_descriptor,
+            STDERR_FILENO) >= 0 else {
+            let restored = restore_standard_streams(
+                saved_stdout: saved_stdout,
+                saved_stderr: saved_stderr,
+                restore_stdout: true,
+                restore_stderr: false)
+            if !restored {
+                staging_to_recycle = nil
+                write_locked(
+                    .error,
+                    event: "rotation_error",
+                    fields: ["error_category": "descriptor_rollback_failed"])
             }
-        }
-        guard swap_result == 0 else {
-            restore_standard_streams(saved_stdout: saved_stdout, saved_stderr: saved_stderr)
             close_rotation_descriptors(staging_descriptor, saved_stdout, saved_stderr)
-            recycle_best_effort(staging_url)
+            if !restored { throw DaemonLoggerError.descriptor_rollback_failed }
+            throw DaemonLoggerError.system_call_failed
+        }
+
+        let swap_result = system_calls.swap_paths(log_url.path, staging_url.path)
+        guard swap_result == 0 else {
+            let restored = restore_standard_streams(
+                saved_stdout: saved_stdout,
+                saved_stderr: saved_stderr,
+                restore_stdout: true,
+                restore_stderr: true)
+            if !restored { staging_to_recycle = nil }
+            close_rotation_descriptors(staging_descriptor, saved_stdout, saved_stderr)
             write_locked(
                 .error,
                 event: "rotation_error",
-                fields: ["error_category": "rename_swap_failed"])
+                fields: [
+                    "error_category": restored
+                        ? "rename_swap_failed"
+                        : "descriptor_rollback_failed",
+                ])
+            if !restored { throw DaemonLoggerError.descriptor_rollback_failed }
             throw DaemonLoggerError.system_call_failed
         }
 
         close_rotation_descriptors(staging_descriptor, saved_stdout, saved_stderr)
-        do {
-            try trash_item(staging_url)
-        } catch {
-            write_locked(
-                .error,
-                event: "rotation_error",
-                fields: ["error_category": error_category(error)])
-        }
+        staging_to_recycle = nil
+        return staging_url
     }
 
     // 功能：幂等停止轮转 timer，不改变 daemon 当前 stdio fd。
@@ -197,15 +305,48 @@ final class DaemonLogger {
     // 返回值：无。
     func stop() {
         state_lock.lock()
+        is_stopping = true
+        monitor_generation &+= 1
         let timer = rotation_timer
         rotation_timer = nil
         state_lock.unlock()
         timer?.setEventHandler {}
         timer?.cancel()
+        if DispatchQueue.getSpecific(key: rotation_queue_key) == nil {
+            monitor_group.wait()
+        }
+        state_lock.lock()
+        is_stopping = false
+        state_lock.unlock()
     }
 
     deinit {
         stop()
+    }
+
+    // 功能：仅为当前 generation 的 timer 执行一次受生命周期跟踪的轮转。
+    // 参数：generation 为 timer 创建时的世代值。
+    // 返回值：无；过期 handler 直接退出。
+    private func run_rotation_monitor(generation: UInt64) {
+        state_lock.lock()
+        guard rotation_timer != nil,
+              generation == monitor_generation,
+              !is_stopping else {
+            state_lock.unlock()
+            return
+        }
+        monitor_group.enter()
+        state_lock.unlock()
+        defer { monitor_group.leave() }
+
+        do {
+            try rotate_if_needed()
+        } catch {
+            write(
+                .error,
+                event: "rotation_error",
+                fields: ["error_category": "rotation_failed"])
+        }
     }
 
     // 功能：创建或收紧日志目录为 0700，并拒绝符号链接和非目录目标。
@@ -280,10 +421,7 @@ final class DaemonLogger {
         case "stage":
             return Self.allowed_stages.contains(value)
         case "host":
-            return !value.isEmpty && value.count <= 255 && value.unicodeScalars.allSatisfy {
-                CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                    + "0123456789.:-[]").contains($0)
-            }
+            return is_allowed_host(value)
         case "port":
             guard let number = Int(value) else { return false }
             return (1...65_535).contains(number)
@@ -297,13 +435,23 @@ final class DaemonLogger {
             guard let number = Int(value) else { return false }
             return number >= 0
         case "error_category":
-            return !value.isEmpty && value.count <= 100 && value.unicodeScalars.allSatisfy {
-                CharacterSet.alphanumerics.union(
-                    CharacterSet(charactersIn: "_.:-")).contains($0)
-            }
+            return Self.allowed_error_categories.contains(value)
         default:
             return false
         }
+    }
+
+    // 功能：只允许 localhost 或可由 inet_pton 完整解析的 IP 地址。
+    // 参数：value 为 host 候选值。
+    // 返回值：值为受支持监听地址时返回 true。
+    private func is_allowed_host(_ value: String) -> Bool {
+        if value == "localhost" { return true }
+        var ipv4_address = in_addr()
+        if value.withCString({ inet_pton(AF_INET, $0, &ipv4_address) }) == 1 {
+            return true
+        }
+        var ipv6_address = in6_addr()
+        return value.withCString({ inet_pton(AF_INET6, $0, &ipv6_address) }) == 1
     }
 
     // 功能：完整写入 stderr；失败时停止且不递归记录原始错误。
@@ -325,12 +473,25 @@ final class DaemonLogger {
         }
     }
 
-    // 功能：用保存的旧 fd 同时恢复 stdout/stderr。
-    // 参数：saved_stdout 和 saved_stderr 为切换前的重复 fd。
-    // 返回值：无。
-    private func restore_standard_streams(saved_stdout: Int32, saved_stderr: Int32) {
-        _ = Darwin.dup2(saved_stdout, STDOUT_FILENO)
-        _ = Darwin.dup2(saved_stderr, STDERR_FILENO)
+    // 功能：按切换状态逐一检查 stdout/stderr 回滚结果。
+    // 参数：saved fd 为旧流；restore 标志表示对应流是否已切换。
+    // 返回值：所有需要恢复的流均成功时返回 true。
+    private func restore_standard_streams(
+        saved_stdout: Int32,
+        saved_stderr: Int32,
+        restore_stdout: Bool,
+        restore_stderr: Bool
+    ) -> Bool {
+        var succeeded = true
+        if restore_stdout,
+           system_calls.replace_descriptor(saved_stdout, STDOUT_FILENO) < 0 {
+            succeeded = false
+        }
+        if restore_stderr,
+           system_calls.replace_descriptor(saved_stderr, STDERR_FILENO) < 0 {
+            succeeded = false
+        }
+        return succeeded
     }
 
     // 功能：关闭一次轮转使用的 staging 与旧标准流重复 fd。
@@ -346,23 +507,4 @@ final class DaemonLogger {
         _ = Darwin.close(saved_stderr)
     }
 
-    // 功能：尽力回收尚未交换的 staging，不永久删除。
-    // 参数：url 为 staging 路径。
-    // 返回值：无；回收失败时保留原文件。
-    private func recycle_best_effort(_ url: URL) {
-        try? trash_item(url)
-    }
-
-    // 功能：把 Error 映射为不含描述和路径的稳定类型类别。
-    // 参数：error 为原错误。
-    // 返回值：仅含类型标识字符的类别。
-    private func error_category(_ error: Error) -> String {
-        let reflected = String(describing: type(of: error))
-        let filtered = reflected.unicodeScalars.filter {
-            CharacterSet.alphanumerics.union(
-                CharacterSet(charactersIn: "_.:-")).contains($0)
-        }
-        let category = String(String.UnicodeScalarView(filtered))
-        return String(category.prefix(100))
-    }
 }

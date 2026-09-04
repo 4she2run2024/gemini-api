@@ -13,6 +13,8 @@ private func test_get_environ()
 
 private let TEST_DAEMON_MODE_ENVIRONMENT = "GEMINI2API_TEST_DAEMON_MODE"
 private let TEST_PARENT_SECRET_ENVIRONMENT = "GEMINI2API_PARENT_SECRET_TOKEN"
+private let TEST_SECRET_SHAPED_MODE = "sk-test-secret-shaped-value-123456"
+private let TEST_UNEXPECTED_CHILD_MARKER = "unexpected-environment-child"
 
 private enum ControllerChildMode: String {
     case normal
@@ -112,6 +114,7 @@ private final class RecordingHealthChecker: HealthChecking {
 private enum ControllerTestError: Error {
     case descriptor_inherited
     case environment_inherited
+    case environment_value_accepted
     case identity_uncertain
     case logger_not_redirected
     case socket_failed
@@ -243,6 +246,10 @@ struct DaemonControllerTests {
             try run_environment_regression_helper()
             return
         }
+        if CommandLine.arguments.dropFirst().first == "--environment-value-regression" {
+            try run_environment_value_regression_helper()
+            return
+        }
         if CommandLine.arguments.dropFirst().first == "--closed-fd-regression" {
             try run_closed_fd_regression_helper()
             return
@@ -290,6 +297,7 @@ struct DaemonControllerTests {
         try test_multithreaded_parent_daemon_lifecycle(test_root: test_root)
         try test_unrelated_descriptor_is_closed_on_exec(test_root: test_root)
         try test_parent_secret_environment_is_not_inherited(test_root: test_root)
+        try test_secret_shaped_environment_value_is_rejected(test_root: test_root)
         try test_stale_state_is_recycled_before_daemon_start(test_root: test_root)
         try test_child_preserves_replaced_state(test_root: test_root)
         try test_port_owner_survives_daemon_conflict(test_root: test_root)
@@ -605,6 +613,20 @@ struct DaemonControllerTests {
         print("EnvironmentRegression passed")
     }
 
+    // 功能：单独运行 child environment value regression，供 RED/GREEN 验证。
+    // 参数：无。
+    // 返回值：通过时输出固定 PASS，并把隔离根移入废纸篓。
+    private static func run_environment_value_regression_helper() throws {
+        let test_root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "gemini2api-environment-value-regression-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: test_root,
+            withIntermediateDirectories: true)
+        defer { recycle_test_root_best_effort(test_root) }
+        try test_secret_shaped_environment_value_is_rejected(test_root: test_root)
+        print("EnvironmentValueRegression passed")
+    }
+
     // 功能：单独运行关闭标准 fd regression，定位 stdio/logger 兼容性。
     // 参数：无。
     // 返回值：通过时输出固定 PASS，并把隔离根移入废纸篓。
@@ -708,6 +730,51 @@ struct DaemonControllerTests {
         }
         guard exit_code == .success, state != nil else {
             throw ControllerTestError.environment_inherited
+        }
+    }
+
+    // 功能：验证 allowlist key 携带 printable secret-shaped value 时在 spawn 前拒绝。
+    // 参数：test_root 为隔离测试总目录。
+    // 返回值：无；若 child 启动、写入探针或发布状态则终止测试。
+    private static func test_secret_shaped_environment_value_is_rejected(
+        test_root: URL
+    ) throws {
+        let root = test_root.appendingPathComponent("daemon-secret-shaped-value")
+        let paths = make_runtime_paths(root: root)
+        let process_inspector = DarwinProcessInspector()
+        let store = Store(config_root: root.appendingPathComponent("config"))
+        store.host = "127.0.0.1"
+        store.port = try available_loopback_port()
+        let state_store = RuntimeStateStore(
+            paths: paths,
+            process_inspector: process_inspector,
+            trash_item: make_fixture_recycler(root: root))
+        let controller = DaemonController(
+            store: store,
+            state_store: state_store,
+            health_checker: URLSessionHealthChecker(),
+            process_inspector: process_inspector,
+            signal_sender: Darwin.kill,
+            child_environment: [
+                TEST_DAEMON_MODE_ENVIRONMENT: TEST_SECRET_SHAPED_MODE,
+            ])
+
+        let exit_code = controller.serve_daemon(options: ServeOptions(
+            host: nil,
+            port: nil,
+            model: nil,
+            daemon: true))
+        let state = try state_store.load()
+        if let state {
+            _ = controller.stop(timeout: 3)
+            try? wait_for_child_exit(pid: state.pid, timeout: 3)
+        }
+        let child_marker = paths.application_directory.appendingPathComponent(
+            TEST_UNEXPECTED_CHILD_MARKER)
+        guard exit_code == .runtime,
+              state == nil,
+              !FileManager.default.fileExists(atPath: child_marker.path) else {
+            throw ControllerTestError.environment_value_accepted
         }
     }
 
@@ -1598,6 +1665,11 @@ struct DaemonControllerTests {
             _exit(CLIExitCode.usage.rawValue)
         }
         let environment = ProcessInfo.processInfo.environment
+        if environment[TEST_DAEMON_MODE_ENVIRONMENT] == TEST_SECRET_SHAPED_MODE {
+            let child_marker = paths.application_directory.appendingPathComponent(
+                TEST_UNEXPECTED_CHILD_MARKER)
+            try? Data().write(to: child_marker)
+        }
         let child_mode: ControllerChildMode
         if let mode_value = environment[TEST_DAEMON_MODE_ENVIRONMENT] {
             guard let parsed_mode = ControllerChildMode(rawValue: mode_value) else {

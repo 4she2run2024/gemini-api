@@ -13,9 +13,13 @@ private let DAEMON_REAP_TIMEOUT_SECONDS: TimeInterval = 0.25
 private let DAEMON_LOCK_DESCRIPTOR: Int32 = 3
 private let DAEMON_READINESS_DESCRIPTOR: Int32 = 4
 private let SPAWN_SOURCE_DESCRIPTOR_MINIMUM: Int32 = 64
-private let ALLOWED_CHILD_ENVIRONMENT_KEYS = Set([
-    "GEMINI2API_TEST_DAEMON_MODE",
-])
+private let ALLOWED_CHILD_ENVIRONMENT_VALUES: [String: Set<String>] = [
+    "GEMINI2API_TEST_DAEMON_MODE": [
+        "early_exit",
+        "readiness_timeout",
+        "late_readiness",
+    ],
+]
 
 enum DaemonChildInvocationParseResult: Equatable {
     case not_internal
@@ -777,9 +781,9 @@ private func spawn_daemon_child(
 
     let arguments = [executable_path] + invocation.command_arguments
     let environment_entries = environment.keys.sorted().compactMap { key -> String? in
-        guard ALLOWED_CHILD_ENVIRONMENT_KEYS.contains(key),
+        guard let allowed_values = ALLOWED_CHILD_ENVIRONMENT_VALUES[key],
               let value = environment[key],
-              valid_child_environment_value(value) else {
+              allowed_values.contains(value) else {
             return nil
         }
         return "\(key)=\(value)"
@@ -794,16 +798,6 @@ private func spawn_daemon_child(
         environment: environment_entries,
         file_actions: &file_actions,
         attributes: &attributes)
-}
-
-// 功能：验证显式 child 测试环境值，拒绝空值、控制字符和过大元数据。
-// 参数：value 为非敏感测试模式名。
-// 返回值：可作为受控 envp value 时为 true。
-private func valid_child_environment_value(_ value: String) -> Bool {
-    !value.isEmpty && value.utf8.count <= 128
-        && !value.unicodeScalars.contains(where: {
-            $0.value < 0x20 || $0.value == 0x7F
-        })
 }
 
 // 功能：为 exec child 预先把三个标准流稳定映射到 /dev/null。

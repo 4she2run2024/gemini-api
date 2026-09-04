@@ -91,4 +91,16 @@ run_test cli-command-tests \
   Sources/cli/cli-command.swift \
   Tests/cli-command-tests.swift
 
+run_test gateway-runtime-tests \
+  "${GATEWAY_SOURCES[@]}" \
+  Sources/HTTPServer.swift \
+  Sources/HTTPServer+Anthropic.swift \
+  Sources/HTTPServer+OpenAI.swift \
+  Sources/http-server-gemini.swift \
+  Sources/http-server-responses.swift \
+  Sources/gateway-runtime.swift \
+  Tests/gateway-runtime-tests.swift \
+  -framework Network \
+  -framework CryptoKit
+
 bash Tests/release-script-tests.sh

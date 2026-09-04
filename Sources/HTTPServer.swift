@@ -6,6 +6,7 @@ import Network
 final class HTTPServer {
     static let shared = HTTPServer(generator: Engine.shared, config: Store.shared)
     private var listener: NWListener?
+    private let listener_lock = NSLock()
     private let queue = DispatchQueue(label: "gemini.http", attributes: .concurrent)
     private let running_lock = NSLock()
     private var running_value = false
@@ -15,6 +16,7 @@ final class HTTPServer {
         return running_value
     }
     var stateDidChange: ((Bool) -> Void)?
+    var state_did_fail: ((Error) -> Void)?
     let generator: TextGenerating
     let cfg: Store
 
@@ -39,20 +41,31 @@ final class HTTPServer {
         }
         l.newConnectionHandler = { [weak self] conn in self?.accept(conn) }
         l.stateUpdateHandler = { [weak self] state in
+            guard let self = self else { return }
             switch state {
-            case .ready: self?.updateRunning(true)
-            case .failed, .cancelled: self?.updateRunning(false)
+            case .ready:
+                self.updateRunning(true)
+            case .failed(let error):
+                self.state_did_fail?(error)
+                self.updateRunning(false)
+            case .cancelled:
+                self.updateRunning(false)
             default: break
             }
         }
         updateRunning(false)
-        l.start(queue: queue)
+        listener_lock.lock()
         listener = l
+        listener_lock.unlock()
+        l.start(queue: queue)
     }
 
     func stop() {
-        listener?.cancel()
+        listener_lock.lock()
+        let active_listener = listener
         listener = nil
+        listener_lock.unlock()
+        active_listener?.cancel()
         updateRunning(false)
     }
 

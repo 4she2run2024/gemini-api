@@ -86,4 +86,9 @@ run_test config-migration-tests \
   Sources/Config.swift \
   Tests/config-migration-tests.swift
 
+run_test cli-command-tests \
+  Sources/Models.swift \
+  Sources/cli/cli-command.swift \
+  Tests/cli-command-tests.swift
+
 bash Tests/release-script-tests.sh

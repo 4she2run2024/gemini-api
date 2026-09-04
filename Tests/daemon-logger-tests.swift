@@ -67,6 +67,21 @@ private final class ScriptedSystemCalls {
     }
 }
 
+private final class CallbackCounter {
+    private let state_lock = NSLock()
+    private var count = 0
+
+    // 功能：原子递增回调次数。
+    // 参数：无。
+    // 返回值：递增后的次数。
+    func next() -> Int {
+        state_lock.lock()
+        defer { state_lock.unlock() }
+        count += 1
+        return count
+    }
+}
+
 @main
 struct DaemonLoggerTests {
     // 功能：运行父进程断言，或按参数进入隔离的 stdio helper。
@@ -93,6 +108,7 @@ struct DaemonLoggerTests {
         try test_partial_dup2_rollback_preserves_each_stream(test_root: test_root)
         try test_rotation_monitor_start_and_stop_are_idempotent(test_root: test_root)
         try test_stop_waits_for_in_flight_monitor(test_root: test_root)
+        try test_timer_reentrant_stop_blocks_followup_rotation(test_root: test_root)
         try test_engine_retry_log_excludes_error_description()
         try assert_secret_fixtures_absent_in_files(test_root: test_root)
         print("DaemonLoggerTests passed")
@@ -243,6 +259,21 @@ struct DaemonLoggerTests {
         precondition(current_data.count == 8)
     }
 
+    // 功能：验证 timer 回调内 stop 返回后，
+    // 同一回调不能再发起第二次轮转。
+    // 参数：test_root 为隔离测试根。
+    // 返回值：无；归档超过一次或新日志被再次切换时终止测试。
+    private static func test_timer_reentrant_stop_blocks_followup_rotation(
+        test_root: URL
+    ) throws {
+        let root = test_root.appendingPathComponent("timer-reentrant-stop")
+        try run_helper(mode: "timer-reentrant-stop", root: root)
+        let archives = try archived_files(root)
+        let current_data = try Data(contentsOf: log_url(root))
+        precondition(archives.count == 1)
+        precondition(current_data == Data(repeating: 0x6e, count: 8))
+    }
+
     // 功能：验证 Engine retry stderr 只记录计数和错误类型，不写原错误描述。
     // 参数：无。
     // 返回值：无；敏感错误描述落盘时终止测试。
@@ -370,6 +401,10 @@ struct DaemonLoggerTests {
             try run_stop_barrier_helper(
                 log_url: log_url,
                 archive_directory: archive_directory)
+        case "timer-reentrant-stop":
+            try run_timer_reentrant_stop_helper(
+                log_url: log_url,
+                archive_directory: archive_directory)
         default:
             throw DaemonLoggerTestError.invalid_arguments
         }
@@ -481,6 +516,35 @@ struct DaemonLoggerTests {
 
         try write_fd(STDOUT_FILENO, bytes: Data(repeating: 0x6e, count: 8))
         Thread.sleep(forTimeInterval: 1.4)
+    }
+
+    // 功能：在真实 timer Trash 回调内 stop 后尝试立即再次轮转。
+    // 参数：log_url 为日志；archive_directory 为归档区。
+    // 返回值：无；同步超时时终止 helper。
+    private static func run_timer_reentrant_stop_helper(
+        log_url: URL,
+        archive_directory: URL
+    ) throws {
+        try seed_log(log_url, count: 8)
+        let callback_counter = CallbackCounter()
+        let callback_completed = DispatchSemaphore(value: 0)
+        var logger: DaemonLogger!
+        logger = DaemonLogger(log_url: log_url, maximum_bytes: 8) { old_url in
+            let callback_count = callback_counter.next()
+            if callback_count == 1 {
+                logger.stop()
+                try write_fd(
+                    STDOUT_FILENO,
+                    bytes: Data(repeating: 0x6e, count: 8))
+                try logger.rotate_if_needed()
+            }
+            try archive(old_url, in: archive_directory)
+            if callback_count == 1 { callback_completed.signal() }
+        }
+        try logger.redirect_standard_streams()
+        logger.start_rotation_monitor()
+        precondition(callback_completed.wait(timeout: .now() + 5) == .success)
+        logger.stop()
     }
 
     // 功能：构造把旧日志移动至夹具归档区的 logger。

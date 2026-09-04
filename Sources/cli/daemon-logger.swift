@@ -82,6 +82,7 @@ final class DaemonLogger {
     private var rotation_timer: DispatchSourceTimer?
     private var monitor_generation: UInt64 = 0
     private var is_stopping = false
+    private var is_stopped = false
 
     // 功能：构造使用动态日志路径、大小阈值和可恢复回收器的
     // daemon logger。
@@ -161,7 +162,7 @@ final class DaemonLogger {
     func start_rotation_monitor() {
         state_lock.lock()
         defer { state_lock.unlock() }
-        guard rotation_timer == nil, !is_stopping else { return }
+        guard rotation_timer == nil, !is_stopping, !is_stopped else { return }
 
         monitor_generation &+= 1
         let generation = monitor_generation
@@ -195,6 +196,10 @@ final class DaemonLogger {
         var operation_error: Error?
 
         state_lock.lock()
+        guard !is_stopping, !is_stopped else {
+            state_lock.unlock()
+            return
+        }
         do {
             old_log_to_trash = try rotate_locked(
                 staging_to_recycle: &staging_to_recycle)
@@ -314,10 +319,10 @@ final class DaemonLogger {
         timer?.cancel()
         if DispatchQueue.getSpecific(key: rotation_queue_key) == nil {
             monitor_group.wait()
+            state_lock.lock()
+            finish_stop_locked()
+            state_lock.unlock()
         }
-        state_lock.lock()
-        is_stopping = false
-        state_lock.unlock()
     }
 
     deinit {
@@ -337,7 +342,12 @@ final class DaemonLogger {
         }
         monitor_group.enter()
         state_lock.unlock()
-        defer { monitor_group.leave() }
+        defer {
+            state_lock.lock()
+            finish_stop_locked()
+            state_lock.unlock()
+            monitor_group.leave()
+        }
 
         do {
             try rotate_if_needed()
@@ -347,6 +357,15 @@ final class DaemonLogger {
                 event: "rotation_error",
                 fields: ["error_category": "rotation_failed"])
         }
+    }
+
+    // 功能：在所有已进入 handler 完成后，把 stop 请求转为最终停止状态。
+    // 参数：无；调用方必须持有 state_lock。
+    // 返回值：无。
+    private func finish_stop_locked() {
+        guard is_stopping else { return }
+        is_stopped = true
+        is_stopping = false
     }
 
     // 功能：创建或收紧日志目录为 0700，并拒绝符号链接和非目录目标。

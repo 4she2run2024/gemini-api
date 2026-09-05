@@ -3,7 +3,7 @@
 
 import Foundation
 
-let GEMINI2API_VERSION = "0.2.0"
+let GEMINI2API_VERSION = "0.2.1"
 
 enum CLIExitCode: Int32 {
     case success = 0

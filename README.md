@@ -1,4 +1,7 @@
-# Gemini2API 0.2.0
+# Gemini2API 0.2.1
+
+修复：识别 Gemini Web 在 HTTP 成功响应中返回的 RPC 错误帧；无文本且无工具调用
+时返回上游错误，避免将失败编码成 `200` 和 `content: null`。流式无输出同样报告错误。
 
 <p align="center">
   <img src="logo.png" width="200" alt="Gemini2API">

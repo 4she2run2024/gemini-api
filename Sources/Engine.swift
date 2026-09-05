@@ -153,12 +153,26 @@ final class Engine: TextGenerating {
         return t
     }
 
+    // 功能：识别 HTTP 成功响应中的 RPC 错误；仅保留数字错误码。
+    // 参数：上游响应行。返回值：已脱敏的错误，或 nil。
+    func upstream_frame_error(_ line: String) -> EngineError? {
+        guard let data = line.data(using: .utf8),
+              let frames = (try? JSONSerialization.jsonObject(with: data)) as? [[Any]]
+        else { return nil }
+        for frame in frames where frame.first as? String == "wrb.fr" {
+            guard frame.count > 5, let failure = frame[5] as? [Any],
+                  let code = failure.first as? Int, code != 0 else { continue }
+            return .other("Gemini Web RPC error \(code)")
+        }
+        return nil
+    }
+
     private func parseTexts(_ line: String) -> [String] {
-        guard line.contains("\"wrb.fr\""), line.unicodeScalars.count >= 200,
+        guard line.contains("\"wrb.fr\""),
               let data = line.data(using: .utf8),
               let arr = (try? JSONSerialization.jsonObject(with: data)) as? [Any],
               let a0 = arr.first as? [Any], a0.count > 2,
-              let innerStr = a0[2] as? String, innerStr.unicodeScalars.count >= 50,
+              let innerStr = a0[2] as? String,
               let innerData = innerStr.data(using: .utf8),
               let inner = (try? JSONSerialization.jsonObject(with: innerData)) as? [Any],
               inner.count > 4, let part4 = inner[4] as? [Any] else { return [] }
@@ -188,7 +202,12 @@ final class Engine: TextGenerating {
         var lastErr: Error = EngineError.other("no attempt")
         for attempt in 0..<cfg.retryAttempts {
             do {
-                try streamRequest(req, isCancelled: isCancelled, onLine: onLine)
+                var frame_error: EngineError?
+                try streamRequest(req, isCancelled: isCancelled) { line in
+                    if let error = self.upstream_frame_error(line) { frame_error = error }
+                    if frame_error == nil { onLine(line) }
+                }
+                if let error = frame_error { throw error }
                 return
             } catch {
                 // 4xx（cookie 失效等）重试无意义，直接抛出
@@ -245,7 +264,9 @@ final class Engine: TextGenerating {
                 if n > longestN { longest = t; longestN = n }
             }
         }
-        return cleanText(longest)
+        let text = cleanText(longest)
+        guard !text.isEmpty else { throw EngineError.other("Gemini Web returned no text") }
+        return text
     }
 
     func generateStream(
@@ -265,6 +286,9 @@ final class Engine: TextGenerating {
                     prev = t
                 }
             }
+        }
+        if !isCancelled() && cleanText(prev).isEmpty {
+            throw EngineError.other("Gemini Web returned no text")
         }
     }
 }

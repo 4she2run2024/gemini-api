@@ -52,13 +52,13 @@ assert_universal_binary "$cli_binary"
 
 short_version="$(plutil -extract CFBundleShortVersionString raw -o - "$info_plist")"
 build_version="$(plutil -extract CFBundleVersion raw -o - "$info_plist")"
-assert_equals "$short_version" "0.2.0" "App 短版本"
-assert_equals "$build_version" "0.2.0" "App 构建版本"
+assert_equals "$short_version" "0.2.1" "App 短版本"
+assert_equals "$build_version" "0.2.1" "App 构建版本"
 
 if otool -L "$cli_binary" | grep -F AppKit >/dev/null; then
   fail "$cli_binary 不应链接 AppKit"
 fi
 assert_equals "$(./gemini2api-macOS --version)" \
-  "Gemini2API 0.2.0" "CLI 版本输出"
+  "Gemini2API 0.2.1" "CLI 版本输出"
 
 echo "build-artifact-tests passed"

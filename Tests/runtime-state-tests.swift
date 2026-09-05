@@ -128,7 +128,7 @@ struct RuntimeStateTests {
         let literal = """
         {"pid":42,"executable_path":"/fixture/gemini2api",\
         "process_started_at":1788520000123456,"instance_id":"fixture-id",\
-        "host":"127.0.0.1","port":8081,"version":"0.2.0"}
+        "host":"127.0.0.1","port":8081,"version":"0.2.1"}
         """
         let decoded = try JSONDecoder().decode(
             DaemonState.self,
@@ -447,7 +447,7 @@ struct RuntimeStateTests {
             instance_id: "current-process",
             host: "127.0.0.1",
             port: 8081,
-            version: "0.2.0")
+            version: "0.2.1")
         precondition(store.identity_matches(state) == .match)
     }
 
@@ -457,7 +457,7 @@ struct RuntimeStateTests {
     private static func make_state(
         pid: Int32 = 42,
         instance_id: String = "fixture-id",
-        version: String = "0.2.0"
+        version: String = "0.2.1"
     ) -> DaemonState {
         DaemonState(
             pid: pid,

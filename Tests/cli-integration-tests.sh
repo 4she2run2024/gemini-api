@@ -625,7 +625,7 @@ PYTHON
   echo "$daemon_pid"
 }
 
-expected_help='gemini2api 0.2.0
+expected_help='gemini2api 0.2.1
 用法：gemini2api <serve|status|stop|version|help> [选项]
   serve [--host HOST] [--port PORT] [--model MODEL] [--daemon]
   status [--json]
@@ -633,7 +633,7 @@ expected_help='gemini2api 0.2.0
 generator_marker="$test_root/generator-resolution.txt"
 assert_generator_not_resolved
 [[ "$(run_cli --help)" == "$expected_help" ]]
-[[ "$(run_cli --version)" == "Gemini2API 0.2.0" ]]
+[[ "$(run_cli --version)" == "Gemini2API 0.2.1" ]]
 ! run_cli invalid-command >"$test_root/invalid.out" 2>"$test_root/invalid.err"
 ! run_cli --gemini2api-internal-daemon-child >"$test_root/internal.out" \
   2>"$test_root/internal.err"
@@ -921,7 +921,7 @@ assert value == {
     "pid": int(sys.argv[2]),
     "port": int(sys.argv[3]),
     "state": "running",
-    "version": "0.2.0",
+    "version": "0.2.1",
 }
 PYTHON
 "$python_binary" - "$config_directory/config.json" <<'PYTHON'
@@ -979,7 +979,7 @@ mkdir -p "$state_directory"
 cat >"$state_directory/daemon.json" <<'JSON'
 {"executable_path":"/missing/test-helper","host":"127.0.0.1",
 "instance_id":"stale","pid":999999,"port":18082,
-"process_started_at":1,"version":"0.2.0"}
+"process_started_at":1,"version":"0.2.1"}
 JSON
 chmod 600 "$state_directory/daemon.json"
 stale_port="$(random_port)"
@@ -995,7 +995,7 @@ record_pid "$forged_owner_pid"
 cat >"$state_directory/daemon.json" <<JSON
 {"executable_path":"/forged/not-owner","host":"127.0.0.1",
 "instance_id":"forged","pid":$forged_owner_pid,"port":18083,
-"process_started_at":1,"version":"0.2.0"}
+"process_started_at":1,"version":"0.2.1"}
 JSON
 chmod 600 "$state_directory/daemon.json"
 set +e

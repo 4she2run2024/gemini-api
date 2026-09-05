@@ -49,7 +49,23 @@ struct GatewayPipelineTests {
         try test_generate_returns_tool_calls()
         try test_generate_maps_errors()
         try test_stream_text_forwards_deltas()
+        try test_empty_output_and_rpc_error()
         print("GatewayPipelineTests passed")
+    }
+
+    // 功能：覆盖短 RPC 错误帧及空生成结果，避免再次返回假成功。
+    // 参数：无。返回值：无；失败时中止测试。
+    private static func test_empty_output_and_rpc_error() throws {
+        let frame = "[[\"wrb.fr\",null,null,null,null,[9,null,[]]]]"
+        precondition(Engine.shared.upstream_frame_error(frame) != nil)
+        precondition(Engine.shared.upstream_frame_error("123") == nil)
+        let generator = FakeGatewayGenerator()
+        generator.output = " \n "
+        let pipeline = GatewayPipeline(generator: generator, default_model: "gemini-3.8-flash")
+        let context = try pipeline.prepare(request(tool_choice: .none))
+        assert_gateway_error(expected_code: "upstream_error") {
+            _ = try pipeline.generate(context)
+        }
     }
 
     // 功能：验证共享 prompt 保留角色、工具调用和工具结果。

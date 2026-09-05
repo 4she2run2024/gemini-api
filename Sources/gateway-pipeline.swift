@@ -54,6 +54,10 @@ final class GatewayPipeline {
             let parsed = try parseStructuredToolCalls(
                 raw_output,
                 allowedToolNames: context.tool_policy.allowedNames)
+            guard !parsed.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || !parsed.calls.isEmpty else {
+                throw GatewayProtocolError.upstream("Upstream returned no output")
+            }
             try context.tool_policy.validate(parsed.calls)
             let tool_calls = parsed.calls.map { call in
                 GatewayToolCall(id: nil, name: call.name, arguments: call.arguments)

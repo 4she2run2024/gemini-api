@@ -4,10 +4,6 @@
 import Foundation
 
 let GEMINI2API_VERSION = "0.2.0"
-private let CLI_RESERVED_OPTIONS: Set<String> = [
-    "--host", "--port", "--model", "--daemon", "--timeout", "--json",
-    "--help", "-h", "--version",
-]
 
 enum CLIExitCode: Int32 {
     case success = 0
@@ -50,13 +46,13 @@ private func throw_usage_error() throws -> Never {
     throw CLIUsageError.invalid_arguments
 }
 
-// 功能：读取 valued option 的下一 token，并拒绝把保留 option 当作值。
+// 功能：读取 valued option 的下一 token，并拒绝任意 option-shaped token。
 // 参数：arguments 为完整参数；index 为当前 option 位置。
-// 返回值：合法的下一 token；缺失或保留 token 时抛出 usage 错误。
+// 返回值：合法的下一 token；缺失、空值或以连字符开头时抛出 usage 错误。
 private func cli_option_value(_ arguments: [String], index: Int) throws -> String {
     guard index + 1 < arguments.count else { try throw_usage_error() }
     let value = arguments[index + 1]
-    guard !value.isEmpty, !CLI_RESERVED_OPTIONS.contains(value) else {
+    guard !value.isEmpty, !value.hasPrefix("-") else {
         try throw_usage_error()
     }
     return value

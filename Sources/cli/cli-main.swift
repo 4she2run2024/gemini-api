@@ -151,22 +151,12 @@ final class CLIApplication {
         generator: TextGenerating
     ) -> CLIExitCode {
         do {
-            _ = try runtime_factory(store, generator).configure(RuntimeOverrides(
-                host: nil,
-                port: nil,
-                model: nil))
-        } catch GatewayRuntimeError.invalid_host,
-                GatewayRuntimeError.invalid_port,
-                GatewayRuntimeError.invalid_model {
-            write_cli_error("配置错误")
-            return .usage
-        } catch {
-            write_cli_error("状态配置检查失败")
-            return .runtime
-        }
-        do {
             let controller = try controller_factory(store, generator)
             let (report, exit_code) = controller.status()
+            guard exit_code != .usage else {
+                write_cli_error("配置错误")
+                return .usage
+            }
             if json {
                 guard let data = try? CLI_STATUS_ENCODER.encode(report),
                       let value = String(data: data, encoding: .utf8) else {

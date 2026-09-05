@@ -195,6 +195,7 @@ private struct StatusFixture {
     let controller: DaemonController
     let health_checker: RecordingHealthChecker
     let state_store: RuntimeStateStore
+    let store: Store
 }
 
 private struct StopFixture {
@@ -288,6 +289,7 @@ struct DaemonControllerTests {
         defer { recycle_test_root_best_effort(test_root) }
 
         try test_status_without_state(test_root: test_root)
+        try test_status_validates_only_endpoint_without_state(test_root: test_root)
         try test_status_with_matching_state(test_root: test_root)
         try test_status_rejects_untrusted_identity(test_root: test_root)
         try test_status_json_keeps_null_fields()
@@ -345,6 +347,37 @@ struct DaemonControllerTests {
         }
     }
 
+    // 功能：验证无可信 state 时只校验 status 所需 host/port，不校验 model。
+    // 参数：test_root 为隔离测试总目录。
+    // 返回值：无；非法 endpoint 被探测或非法 model 阻断 status 时终止测试。
+    private static func test_status_validates_only_endpoint_without_state(
+        test_root: URL
+    ) throws {
+        let invalid_endpoints = [("invalid host", 18_081), ("127.0.0.1", 0)]
+        for (index, endpoint) in invalid_endpoints.enumerated() {
+            let fixture = make_status_fixture(
+                root: test_root.appendingPathComponent("invalid-endpoint-\(index)"),
+                health_result: .unreachable,
+                process_result: { _ in nil })
+            fixture.store.host = endpoint.0
+            fixture.store.port = endpoint.1
+            fixture.store.defaultModel = "unknown-model"
+            let (_, exit_code) = fixture.controller.status()
+            precondition(exit_code == .usage)
+            precondition(fixture.health_checker.calls.isEmpty)
+        }
+
+        let model_fixture = make_status_fixture(
+            root: test_root.appendingPathComponent("invalid-model-only"),
+            health_result: .unreachable,
+            process_result: { _ in nil })
+        model_fixture.store.defaultModel = "unknown-model"
+        let (report, exit_code) = model_fixture.controller.status()
+        precondition(report.state == .stopped)
+        precondition(exit_code == .stopped)
+        precondition(model_fixture.health_checker.calls.count == 1)
+    }
+
     // 功能：验证匹配状态使用记录地址，并按健康结果分类 running/unhealthy。
     // 参数：test_root 为隔离测试总目录。
     // 返回值：无；地址、报告或退出码不符时终止测试。
@@ -362,6 +395,9 @@ struct DaemonControllerTests {
                 process_result: { _ in ProcessIdentity(
                     executable_path: state.executable_path,
                     process_started_at: state.process_started_at) })
+            fixture.store.host = "invalid host"
+            fixture.store.port = 0
+            fixture.store.defaultModel = "unknown-model"
             let (report, exit_code) = fixture.controller.status()
             precondition(report == StatusReport(
                 state: item.1,
@@ -1277,7 +1313,8 @@ struct DaemonControllerTests {
         return StatusFixture(
             controller: controller,
             health_checker: health_checker,
-            state_store: state_store)
+            state_store: state_store,
+            store: store)
     }
 
     // 功能：创建并发布状态后返回 controller 测试夹具。

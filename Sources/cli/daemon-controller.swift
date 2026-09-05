@@ -484,6 +484,16 @@ final class DaemonController {
     // 参数：无。
     // 返回值：stopped、unmanaged 或 conflict 报告与退出码。
     private func status_without_state() -> (StatusReport, CLIExitCode) {
+        guard valid_status_endpoint(host: store.host, port: store.port) else {
+            return (StatusReport(
+                state: .stopped,
+                managed: false,
+                healthy: nil,
+                pid: nil,
+                host: store.host,
+                port: store.port,
+                version: nil), .usage)
+        }
         let result = health_checker.check(
             host: health_probe_host(store.host),
             port: store.port,
@@ -533,6 +543,20 @@ final class DaemonController {
     // 返回值：0.0.0.0 对应 127.0.0.1，其余地址原样返回。
     private func health_probe_host(_ host: String) -> String {
         host == "0.0.0.0" ? "127.0.0.1" : host
+    }
+
+    // 功能：只校验无 state 的 status 健康探测所需 host 与 port。
+    // 参数：host、port 来自已加载配置。
+    // 返回值：可用于 endpoint 探测时为 true；不读取或校验 model。
+    private func valid_status_endpoint(host: String, port: Int) -> Bool {
+        guard !host.isEmpty,
+              host.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+              host.rangeOfCharacter(from: .controlCharacters) == nil,
+              (1...65_535).contains(port) else {
+            return false
+        }
+        _ = NWEndpoint.Host(host)
+        return true
     }
 }
 

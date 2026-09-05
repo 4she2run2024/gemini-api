@@ -145,6 +145,24 @@ run_test daemon-controller-tests \
   -framework Network \
   -framework CryptoKit
 
+run_test cli-main-tests \
+  "${GATEWAY_SOURCES[@]}" \
+  Sources/HTTPServer.swift \
+  Sources/HTTPServer+Anthropic.swift \
+  Sources/HTTPServer+OpenAI.swift \
+  Sources/http-server-gemini.swift \
+  Sources/http-server-responses.swift \
+  Sources/gateway-runtime.swift \
+  Sources/cli/cli-command.swift \
+  Sources/cli/runtime-state.swift \
+  Sources/cli/daemon-logger.swift \
+  Sources/cli/daemon-controller.swift \
+  Sources/cli/cli-main.swift \
+  Tests/cli-main-tests.swift \
+  -D GEMINI2API_LIBRARY \
+  -framework Network \
+  -framework CryptoKit
+
 bash -n Tests/build-artifact-tests.sh
 bash Tests/release-script-tests.sh
 bash Tests/cli-integration-tests.sh --auto

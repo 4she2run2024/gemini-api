@@ -28,6 +28,8 @@ private final class RuntimeFakeGenerator: TextGenerating {
 private enum RuntimeTestError: Error {
     case child_failed
     case invalid_arguments
+    case listener_not_ready
+    case listener_stop_failed
     case listener_still_running
     case process_timeout
     case socket_failed
@@ -63,6 +65,8 @@ struct GatewayRuntimeTests {
         try test_invalid_overrides_are_rejected(test_root: test_root)
         try test_occupied_port_reports_listener_failure(test_root: test_root)
         try test_overlapping_listener_bind_is_exclusive(test_root: test_root)
+        try test_app_style_same_port_restart(test_root: test_root)
+        try test_listener_callback_stop_is_bounded(test_root: test_root)
         try test_post_ready_listener_failure_is_retained(test_root: test_root)
         try test_signal_stops_listener(signal_number: SIGINT, test_root: test_root)
         try test_signal_stops_listener(signal_number: SIGTERM, test_root: test_root)
@@ -199,6 +203,74 @@ struct GatewayRuntimeTests {
             } catch GatewayRuntimeError.listener_failed {
                 second_runtime.stop()
             }
+        }
+    }
+
+    // 功能：验证 App 保存设置时可等待旧 listener 停止后重复绑定同一地址。
+    // 参数：test_root 为隔离测试总目录。
+    // 返回值：无；任一轮未恢复 ready 或根路由不可用时抛错。
+    private static func test_app_style_same_port_restart(test_root: URL) throws {
+        let store = try make_loaded_store(
+            config_root: test_root.appendingPathComponent("app-same-port-restart"))
+        store.host = "127.0.0.1"
+        store.port = try available_loopback_port()
+        let server = HTTPServer(generator: RuntimeFakeGenerator(), config: store)
+        try server.start()
+        defer { _ = server.stop() }
+        try wait_until_server_ready(server)
+
+        for _ in 0..<3 {
+            guard server.stop() else { throw RuntimeTestError.listener_stop_failed }
+            try server.start()
+            try wait_until_server_ready(server)
+            let response = try request_root(port: store.port)
+            precondition(response.contains("HTTP/1.1 200"))
+        }
+    }
+
+    // 功能：验证 listener callback 内调用 stop 会有界失败，不等待自身取消。
+    // 参数：test_root 为隔离测试总目录。
+    // 返回值：无；callback 阻塞或停止结果不可观察时抛错。
+    private static func test_listener_callback_stop_is_bounded(
+        test_root: URL
+    ) throws {
+        let store = try make_loaded_store(
+            config_root: test_root.appendingPathComponent("callback-stop"))
+        store.host = "127.0.0.1"
+        store.port = try available_loopback_port()
+        let server = HTTPServer(generator: RuntimeFakeGenerator(), config: store)
+        let result_lock = NSLock()
+        let callback_finished = DispatchSemaphore(value: 0)
+        var did_request_stop = false
+        var stop_result: Bool?
+        var stop_duration: TimeInterval = 1
+        server.stateDidChange = { running in
+            result_lock.lock()
+            let should_stop = running && !did_request_stop
+            if should_stop { did_request_stop = true }
+            result_lock.unlock()
+            guard should_stop else { return }
+            let started_at = Date()
+            let result = server.stop(timeout: 0.1)
+            result_lock.lock()
+            stop_result = result
+            stop_duration = Date().timeIntervalSince(started_at)
+            result_lock.unlock()
+            callback_finished.signal()
+        }
+
+        try server.start()
+        guard callback_finished.wait(timeout: .now() + 1) == .success else {
+            throw RuntimeTestError.listener_stop_failed
+        }
+        result_lock.lock()
+        let observed_result = stop_result
+        let observed_duration = stop_duration
+        result_lock.unlock()
+        precondition(observed_result == false)
+        precondition(observed_duration < 0.5)
+        guard server.stop(timeout: 2) else {
+            throw RuntimeTestError.listener_stop_failed
         }
     }
 
@@ -439,6 +511,17 @@ struct GatewayRuntimeTests {
             Thread.sleep(forTimeInterval: 0.02)
         }
         throw RuntimeTestError.listener_still_running
+    }
+
+    // 功能：有界等待真实 HTTPServer 进入 ready。
+    // 参数：server 为 App 风格直接管理的共享 listener。
+    // 返回值：ready 时返回；期限内未 ready 时抛错。
+    private static func wait_until_server_ready(_ server: HTTPServer) throws {
+        for _ in 0..<100 {
+            if server.running { return }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        throw RuntimeTestError.listener_not_ready
     }
 
     // 功能：探测 loopback 端口当前是否接受 TCP 连接。

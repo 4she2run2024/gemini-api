@@ -179,8 +179,8 @@ final class GatewayRuntime {
     // 参数：无。
     // 返回值：无。
     func stop() {
-        server.stop()
-        complete_termination(.stopped)
+        let did_stop = server.stop()
+        complete_termination(did_stop ? .stopped : .listener_failed)
     }
 
     // 功能：锁保护地发布一次终止事件。

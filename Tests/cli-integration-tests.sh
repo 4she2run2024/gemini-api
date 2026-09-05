@@ -637,6 +637,14 @@ assert_generator_not_resolved
 ! run_cli invalid-command >"$test_root/invalid.out" 2>"$test_root/invalid.err"
 ! run_cli --gemini2api-internal-daemon-child >"$test_root/internal.out" \
   2>"$test_root/internal.err"
+set +e
+run_cli serve --host --definitely-unknown-option \
+  >"$test_root/unknown-value.out" 2>"$test_root/unknown-value.err"
+unknown_value_code=$?
+set -e
+[[ "$unknown_value_code" == "2" ]]
+[[ ! -s "$test_root/unknown-value.out" ]]
+[[ "$(<"$test_root/unknown-value.err")" == "$expected_help" ]]
 [[ ! "$expected_help" =~ gemini2api-internal-daemon-child ]]
 assert_generator_not_resolved
 
@@ -653,7 +661,7 @@ cat >"$config_directory/config.json" <<'JSON'
 JSON
 chmod 600 "$config_directory/config.json"
 
-for invalid_config_case in host port model; do
+for invalid_config_case in host port; do
   "$python_binary" - "$config_directory/config.json" "$invalid_config_case" <<'PYTHON'
 import json
 import sys
@@ -670,8 +678,6 @@ if case == "host":
     config["host"] = "invalid host"
 elif case == "port":
     config["port"] = 0
-else:
-    config["default_model"] = "unknown-model"
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(config, handle)
 PYTHON
@@ -688,6 +694,30 @@ PYTHON
   [[ ! -s "$test_root/status-invalid-$invalid_config_case.out" ]]
   [[ "$(<"$test_root/status-invalid-$invalid_config_case.err")" == *"配置错误"* ]]
 done
+
+invalid_model_port="$(random_port)"
+"$python_binary" - "$config_directory/config.json" "$invalid_model_port" <<'PYTHON'
+import json
+import sys
+
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump({
+        "host": "127.0.0.1",
+        "port": int(sys.argv[2]),
+        "default_model": "unknown-model",
+        "log_requests": False,
+        "api_keys": ["integration-key"],
+    }, handle)
+PYTHON
+chmod 600 "$config_directory/config.json"
+set +e
+run_cli status >"$test_root/status-invalid-model.out" \
+  2>"$test_root/status-invalid-model.err"
+invalid_model_status_code=$?
+set -e
+[[ "$invalid_model_status_code" == "3" ]]
+[[ "$(<"$test_root/status-invalid-model.out")" == *"stopped"* ]]
+[[ ! -s "$test_root/status-invalid-model.err" ]]
 if [[ -e "$generator_marker" ]]; then
   mv "$generator_marker" "$test_root/status-generator-resolution.txt"
 fi
@@ -864,6 +894,20 @@ daemon_pid="$(record_daemon_pid)"
 [[ "$(<"$generator_marker")" == "store-loaded" ]]
 kill -0 "$daemon_pid"
 wait_for_http "$daemon_port"
+"$python_binary" - "$config_directory/config.json" <<'PYTHON'
+import json
+import sys
+
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump({
+        "host": "invalid host",
+        "port": 0,
+        "default_model": "unknown-model",
+        "log_requests": False,
+        "api_keys": ["integration-key"],
+    }, handle)
+PYTHON
+chmod 600 "$config_directory/config.json"
 [[ "$(run_cli status)" == *"running"* ]]
 status_json="$(run_cli status --json)"
 "$python_binary" - "$status_json" "$daemon_pid" "$daemon_port" <<'PYTHON'
@@ -880,6 +924,20 @@ assert value == {
     "version": "0.2.0",
 }
 PYTHON
+"$python_binary" - "$config_directory/config.json" <<'PYTHON'
+import json
+import sys
+
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump({
+        "host": "127.0.0.1",
+        "port": 18081,
+        "default_model": "gemini-3.6-flash",
+        "log_requests": False,
+        "api_keys": ["integration-key"],
+    }, handle)
+PYTHON
+chmod 600 "$config_directory/config.json"
 request_body='{"model":"gemini-3.6-flash","input":"ping"}'
 [[ "$(curl -sS -o /dev/null -w '%{http_code}' \
   -H 'Content-Type: application/json' \

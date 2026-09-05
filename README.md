@@ -148,6 +148,10 @@ gemini2api stop --timeout 10
 }
 ```
 
+存在可核验的 daemon 状态时，`status` 优先使用状态文件记录的地址，
+不受之后写坏的 host、port 或 model 配置影响。没有可信状态时只校验并探测
+当前配置的 host 和 port；model 不参与状态查询。
+
 CLI 使用以下稳定退出码：
 
 | 退出码 | 含义 |
@@ -379,6 +383,10 @@ macOS 废纸篓，不永久删除。
 `status` 会探测配置中的端口；收到健康的 Gemini2API 响应时报告 `unmanaged`，
 但 owner 未知，不会推断该响应属于 App 或前台 CLI。
 
+App 保存设置并重启服务时，会先有界等待旧 listener 进入取消终态，
+再绑定新 listener；因此可以可靠地在同一 host 和 port 上重启，
+同时继续保持端口独占。
+
 `stop` 只会在状态文件、PID、实际可执行路径、进程启动时间和版本均
 匹配时，向受托管 daemon 发送一次 `SIGTERM`。它不会停止 App、前台 CLI 或
 第三方进程；超时后返回退出码 `5`，不会升级为 `SIGKILL`。
@@ -450,6 +458,8 @@ GitHub Actions 的 Test step 只调用统一 runner，随后构建并验证通�
 
 - 新增不链接 AppKit 的 `gemini2api-macOS` 通用 headless CLI。
 - 新增前台 `serve`、托管 daemon、稳定状态输出和安全 stop 生命周期。
+- 修复 App 同端口重启，并让 `status` 优先采用已核验 daemon 状态地址。
+- valued option 拒绝任意以连字符开头的 token，避免未知 option 被当作值。
 - 新增动态运行状态与日志路径、严格文件权限、脱敏日志和废纸篓轮转。
 - 构建与 CI 同步验证 App、CLI 的双架构、版本和 Release 附件清单。
 - 保持既有配置格式、七个 endpoint、SDK 用例和协议限制兼容。

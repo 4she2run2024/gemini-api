@@ -69,6 +69,15 @@ struct CLICommandTests {
         for arguments in reserved_value_cases {
             expect_usage_error(arguments)
         }
+        let unknown_option_value_cases = [
+            ["serve", "--host", "--definitely-unknown-option"],
+            ["serve", "--port", "--definitely-unknown-option"],
+            ["serve", "--model", "--definitely-unknown-option"],
+            ["stop", "--timeout", "--definitely-unknown-option"],
+        ]
+        for arguments in unknown_option_value_cases {
+            expect_usage_error(arguments)
+        }
         let duplicate_value_cases = [
             ["serve", "--host", "127.0.0.1", "--host", "127.0.0.2"],
             ["serve", "--port", "8080", "--port", "8081"],
@@ -79,7 +88,9 @@ struct CLICommandTests {
             expect_usage_error(arguments)
         }
         expect_usage_error(["serve", "--port", "0"])
+        expect_usage_error(["serve", "--port", "-1"])
         expect_usage_error(["serve", "--port", "65536"])
+        expect_usage_error(["stop", "--timeout", "-1"])
         expect_usage_error(["serve", "--daemon", "--daemon"])
         expect_usage_error(["status", "--daemon"])
         expect_usage_error(["--gemini2api-internal-daemon-child"])

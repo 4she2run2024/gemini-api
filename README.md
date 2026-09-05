@@ -1,4 +1,4 @@
-# Gemini2API 0.1.0
+# Gemini2API 0.2.0
 
 <p align="center">
   <img src="logo.png" width="200" alt="Gemini2API">
@@ -6,8 +6,9 @@
 
 ## 项目说明
 
-Gemini2API 是一个 macOS 菜单栏本地 API Gateway。它复用 Gemini 网页端生成核心，
-向允许配置 Base URL 的客户端提供 OpenAI、Anthropic 和 Gemini 风格的文本接口。
+Gemini2API 是一个 macOS 本地 API Gateway。它可以通过菜单栏 App 或独立的
+headless CLI 运行，复用 Gemini 网页端生成核心，向允许配置 Base URL 的客户端
+提供 OpenAI、Anthropic 和 Gemini 风格的文本接口。
 
 本项目不是 Google、OpenAI 或 Anthropic 的官方服务。协议兼容只覆盖下文列出的
 能力；客户端名称或配置示例不代表该客户端的全部功能均受支持。
@@ -19,9 +20,11 @@ Gemini2API 是一个 macOS 菜单栏本地 API Gateway。它复用 Gemini 网页
 - 提供 Gemini GenerateContent 与流式 GenerateContent 接口。
 - 支持文本、多轮角色、本地 function calling 和工具结果续轮。
 - 支持非流式 JSON 与协议对应的 SSE 文本增量。
+- 支持 CLI 前台服务和退出终端后继续运行的当前用户 daemon。
+- 支持查询 daemon 状态，并在完整验证进程身份后安全停止托管实例。
 - 使用 Bearer、`x-api-key`、`x-goog-api-key` 或 `key` query 参数鉴权。
 - 保留旧 Gemini Free 配置，并一次性迁移到 Gemini2API 的独立配置目录。
-- 以 Swift 构建 Intel 与 Apple 芯片通用 App，不增加项目运行时依赖。
+- 以 Swift 构建 Intel 与 Apple 芯片通用 App 和 CLI，不增加运行时依赖。
 
 ## API 与兼容矩阵
 
@@ -29,7 +32,7 @@ Gemini2API 是一个 macOS 菜单栏本地 API Gateway。它复用 Gemini 网页
 OpenAI 客户端的 Base URL 通常需要
 追加 `/v1`。
 
-| Endpoint | 协议 | v0.1.0 状态 | 关键输出 |
+| Endpoint | 协议 | v0.2.0 状态 | 关键输出 |
 | --- | --- | --- | --- |
 | `GET /v1/models` | OpenAI | 支持 | `object: list` |
 | `POST /v1/chat/completions` | OpenAI | 支持 | `chat.completion` 或 SSE |
@@ -54,17 +57,39 @@ OpenAI 客户端的 Base URL 通常需要
 
 | 场景 | 最低要求 | 安装或检查命令 |
 | --- | --- | --- |
-| 运行 App | macOS 13.0+ | `sw_vers -productVersion` |
+| 运行 App 或 CLI | macOS 13.0+ | `sw_vers -productVersion` |
 | 源码构建与测试 | Swift 6.0+ 的 Xcode Command Line Tools | `xcode-select --install` |
 | 制作 DMG | `create-dmg` 1.3.0+ | `brew install create-dmg` |
 
-`create-dmg` 只用于生成 DMG，不是 App 的运行时依赖。OpenAI、Anthropic 和 Gemini
-SDK 也只是后文示例的可选客户端依赖，不会写入本项目。
+`create-dmg` 只用于生成 DMG，不是 App 的运行时依赖。OpenAI、Anthropic 和
+Gemini SDK 也只是后文示例的可选客户端依赖，不会写入本项目。
+0.2.0 没有新增 runtime dependency；独立 CLI 不链接 AppKit。
 
 ## 安装方法
 
-从 [Releases](../../releases/latest) 下载 `Gemini2API.dmg` 或
+从 [Releases](../../releases/latest) 下载 App 附件 `Gemini2API.dmg` 或
 `Gemini2API-macOS.zip`。DMG 安装方式是把 `Gemini2API.app` 拖入 Applications。
+
+如需独立 CLI，请下载 `gemini2api-macOS`。以下示例动态使用当前用户目录；
+如果目标已经存在，只提示用户处理，不会覆盖原文件：
+
+```bash
+download_path="./gemini2api-macOS"
+bin_dir="${HOME}/.local/bin"
+target_path="${bin_dir}/gemini2api"
+
+mkdir -p "$bin_dir"
+if [[ -e "$target_path" || -L "$target_path" ]]; then
+  printf '目标已存在，请先备份或移动：%s\n' "$target_path" >&2
+else
+  install -m 0755 "$download_path" "$target_path"
+fi
+
+export PATH="$bin_dir:$PATH"
+gemini2api --version
+```
+
+要让后续终端也能找到 CLI，请把 `bin_dir` 对应目录加入 shell 的 `PATH` 配置。
 
 从源码构建：
 
@@ -74,12 +99,71 @@ git clone https://github.com/4she2run2024/gemini-api.git "$repo_dir"
 cd "$repo_dir"
 ./build.sh
 open Gemini2API.app
+./gemini2api-macOS --version
 ```
 
 ## 使用方法
 
 启动 `Gemini2API.app` 后，通过菜单栏的“设置”确认端口、监听地址与
-API Key。
+API Key。App 用户可以继续只使用菜单栏入口；CLI 是可选入口。
+
+### CLI 命令
+
+```text
+gemini2api serve [--host HOST] [--port PORT] [--model MODEL]
+gemini2api serve [--host HOST] [--port PORT] [--model MODEL] --daemon
+gemini2api status [--json]
+gemini2api stop [--timeout SECONDS]
+gemini2api --version
+gemini2api --help
+```
+
+`serve` 默认在当前终端前台运行；`serve --daemon` 启动当前用户的托管 daemon。
+daemon 会在终端关闭后继续运行，但注销或重启后停止，本版本不会安装
+LaunchAgent 或系统 LaunchDaemon。CLI 不需要交互式问答，例如：
+
+```bash
+# 前台运行；按 Ctrl-C 或发送 SIGTERM 停止
+gemini2api serve --host 127.0.0.1 --port 8081 \
+  --model gemini-3.6-flash
+
+# 或启动 daemon，查询状态后安全停止；stop 默认等待 10 秒
+gemini2api serve --daemon
+gemini2api status --json
+gemini2api stop --timeout 10
+```
+
+`status --json` 输出固定字段；无值字段编码为 `null`，`state` 只会是
+`running`、`unhealthy`、`stopped`、`unmanaged` 或 `conflict`：
+
+```json
+{
+  "healthy": true,
+  "host": "127.0.0.1",
+  "managed": true,
+  "pid": 12345,
+  "port": 8081,
+  "state": "running",
+  "version": "0.2.0"
+}
+```
+
+存在可核验的 daemon 状态时，`status` 优先使用状态文件记录的地址，
+不受之后写坏的 host、port 或 model 配置影响。没有可信状态时只校验并探测
+当前配置的 host 和 port；model 不参与状态查询。
+
+CLI 使用以下稳定退出码：
+
+| 退出码 | 含义 |
+| --- | --- |
+| `0` | 命令成功，或 `status` 确认托管 daemon 健康 |
+| `2` | 命令、参数或配置错误 |
+| `3` | daemon 未运行，或进程存在但 HTTP 健康检查失败 |
+| `4` | PID 身份不匹配，或端口、实例所有权冲突 |
+| `5` | HTTP listener、daemon 化、状态发布或停止等待失败 |
+
+### HTTP 请求
+
 以下七个示例在未配置 API Key 时可以直接运行；如已配置 Key，请增加
 `Authorization: Bearer <key>` 或对应协议支持的其他鉴权方式。
 
@@ -121,9 +205,11 @@ curl -N "$base_url/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse"
   -d '{"contents":[{"role":"user","parts":[{"text":"你好"}]}]}'
 ```
 
-## OpenAI SDK、Codex、Claude Code、Anthropic SDK、Gemini SDK 示例
+## CLI 服务客户端示例
 
-以下内容是配置示例。当前版本已经通过真实 Gemini Web 上游 smoke，
+先运行 `gemini2api serve` 或 `gemini2api serve --daemon`，再使用以下 Base URL
+把 Codex、Claude Code、OpenAI SDK、Anthropic SDK 或 Gemini SDK 指向 CLI 服务。
+当前协议已经通过真实 Gemini Web 上游 smoke，
 并在隔离环境中通过 OpenAI Python SDK 3.8.0、Anthropic Python SDK 1.3.0 和
 Google Gen AI Node SDK 2.21.0 的文本、流式与本地 function calling smoke。
 这仍不代表客户端全部能力均受支持；升级 SDK 后应重新执行验收。
@@ -236,6 +322,17 @@ console.log(response.text);
 
 ## 配置说明与旧配置迁移
 
+CLI 的配置优先级为：
+
+```text
+CLI 本次参数 > ~/.config/gemini2api/config.json > Store 声明默认值
+```
+
+只有 `--host`、`--port` 和 `--model` 会覆盖本次运行的内存值；CLI 不会把覆盖值
+写回配置。`--port` 只接受 `1...65535`，`--model` 只接受现有模型，可选的
+`@think=N` 中 `N` 必须为 `0...4`。Cookie、代理、`auth_user`、`xsrf_token` 和
+Gateway API Key 不提供 CLI 参数，仍由 App 或配置文件管理。
+
 新配置逻辑路径为 `~/.config/gemini2api/config.json`。首次启动时按以下
 顺序处理：
 
@@ -266,6 +363,34 @@ console.log(response.text);
 API Key，并由系统防火墙限制来源。不要把 Cookie、API Key 或配置文件提交
 到版本库。
 
+### daemon 状态与日志
+
+以下是供用户查看的路径形式；实现会通过 macOS 用户域 API 动态生成路径，
+不会硬编码用户主目录：
+
+```text
+~/Library/Application Support/Gemini2API/runtime/daemon.json
+~/Library/Application Support/Gemini2API/runtime/daemon.lock
+~/Library/Logs/Gemini2API/gemini2api.log
+```
+
+Application Support、`runtime` 和 Logs 中的 Gemini2API 目录权限为 `0700`；
+状态、锁和日志文件权限为 `0600`。daemon 日志达到 5 MiB 时轮转，旧日志移入
+macOS 废纸篓，不永久删除。
+
+同一端口只能由一个 listener 使用。App、前台 CLI、托管 daemon 或第三方程序
+占用目标端口时，新实例只报告冲突，不查杀端口 owner。无托管状态时，
+`status` 会探测配置中的端口；收到健康的 Gemini2API 响应时报告 `unmanaged`，
+但 owner 未知，不会推断该响应属于 App 或前台 CLI。
+
+App 保存设置并重启服务时，会先有界等待旧 listener 进入取消终态，
+再绑定新 listener；因此可以可靠地在同一 host 和 port 上重启，
+同时继续保持端口独占。
+
+`stop` 只会在状态文件、PID、实际可执行路径、进程启动时间和版本均
+匹配时，向受托管 daemon 发送一次 `SIGTERM`。它不会停止 App、前台 CLI 或
+第三方进程；超时后返回退出码 `5`，不会升级为 `SIGKILL`。
+
 ## 已知限制
 
 - Gemini Web 是非官方上游，可能因网页协议、账号状态或网络变化而失效。
@@ -276,6 +401,7 @@ API Key，并由系统防火墙限制来源。不要把 Cookie、API Key 或配�
 - token 数量是近似值，不能作为账单或精确上下文容量依据。
 - 生成控制参数会被接受，但网页上游不保证严格执行。
 - App 使用 ad-hoc 签名且未做 Apple 公证。
+- CLI daemon 不会在注销或重启后自动恢复，并且同一时间只管理一个实例。
 - 官方 SDK 或 Gemini Web 协议升级后需要重新运行独立 smoke 验收。
 
 ## 常见问题
@@ -303,13 +429,19 @@ xattr -dr com.apple.quarantine "Gemini2API.app"
 工具 block 必须先完整生成、解析并确认只引用已声明工具，之后才能编码为
 合法事件。
 
+### 为什么 daemon 启动时报端口或实例冲突？
+
+App、前台 CLI、已有 daemon 或其他程序可能已使用该端口。先运行
+`gemini2api status --json` 查看分类；如需并行前台实例，可用 `--port` 选择其他
+端口。`stop` 只处理身份验证通过的托管 daemon，不会清理未知占用者。
+
 ## 构建与测试
 
 ```bash
 # 七 endpoint HTTP integration、全部 Swift 测试与 Release 脚本安全检查
 bash Tests/run-tests.sh --auto
 
-# 构建 Gemini2API.app
+# 构建 Gemini2API.app 和 gemini2api-macOS
 ./build.sh
 
 # 可选：构建 ZIP 与 DMG
@@ -317,10 +449,21 @@ ditto -c -k --keepParent Gemini2API.app Gemini2API-macOS.zip
 ./make-dmg.sh
 ```
 
-GitHub Actions 的 Test step 只调用统一 runner，随后构建 `Gemini2API.app`、
-`Gemini2API-macOS.zip` 和 `Gemini2API.dmg`。CI 不自动创建 Release。
+GitHub Actions 的 Test step 只调用统一 runner，随后构建并验证通用 App 与 CLI，
+再生成 `Gemini2API-macOS.zip` 和 `Gemini2API.dmg`。CI 不自动创建 Release。
 
 ## 更新历史
+
+### 0.2.0
+
+- 新增不链接 AppKit 的 `gemini2api-macOS` 通用 headless CLI。
+- 新增前台 `serve`、托管 daemon、稳定状态输出和安全 stop 生命周期。
+- 修复 App 同端口重启，并让 `status` 优先采用已核验 daemon 状态地址。
+- valued option 拒绝任意以连字符开头的 token，避免未知 option 被当作值。
+- 状态文本避免依赖新版 Swift 的可选布尔穷尽分析，兼容 CI 编译器。
+- 新增动态运行状态与日志路径、严格文件权限、脱敏日志和废纸篓轮转。
+- 构建与 CI 同步验证 App、CLI 的双架构、版本和 Release 附件清单。
+- 保持既有配置格式、七个 endpoint、SDK 用例和协议限制兼容。
 
 ### 0.1.0
 

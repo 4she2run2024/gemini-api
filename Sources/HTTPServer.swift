@@ -1,12 +1,73 @@
 import Foundation
 import Network
 
+private let HTTP_SERVER_STOP_TIMEOUT_SECONDS: TimeInterval = 2
+
+// 功能：表达旧 listener 未在有界期限内完成取消。
+enum HTTPServerLifecycleError: Error {
+    case stop_timed_out
+}
+
+// 功能：记录单代 listener 的 cancelled 终态，并允许多次有界等待。
+private final class HTTPListenerCancellation {
+    private let condition = NSCondition()
+    private var cancelled = false
+
+    // 功能：发布 cancelled 终态并唤醒全部等待者。
+    // 参数：无。
+    // 返回值：无；重复调用保持幂等。
+    func complete() {
+        condition.lock()
+        cancelled = true
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    // 功能：在固定期限内等待 cancelled 终态。
+    // 参数：timeout 为最长等待秒数。
+    // 返回值：期限内已 cancelled 时为 true。
+    func wait(timeout: TimeInterval) -> Bool {
+        guard timeout >= 0, timeout.isFinite else { return false }
+        condition.lock()
+        defer { condition.unlock() }
+        let deadline = Date().addingTimeInterval(timeout)
+        while !cancelled {
+            guard condition.wait(until: deadline) else { break }
+        }
+        return cancelled
+    }
+}
+
+// 功能：绑定 listener、generation 与单代取消状态。
+private final class HTTPListenerRecord {
+    let listener: NWListener
+    let generation: UInt64
+    let cancellation: HTTPListenerCancellation
+    var is_stopping = false
+
+    // 功能：创建不可跨代复用的 listener 记录。
+    // 参数：listener 为真实监听器；generation 为代际 token；cancellation 为终态。
+    // 返回值：初始化后的记录。
+    init(
+        listener: NWListener,
+        generation: UInt64,
+        cancellation: HTTPListenerCancellation
+    ) {
+        self.listener = listener
+        self.generation = generation
+        self.cancellation = cancellation
+    }
+}
+
 // 用途：提供 OpenAI、Anthropic 与 Gemini 兼容的极简 HTTP/1.1 路由和写出层。
 // 使用方法：以生成器和配置初始化 HTTPServer，再调用 start 启动监听。
 final class HTTPServer {
     static let shared = HTTPServer(generator: Engine.shared, config: Store.shared)
-    private var listener: NWListener?
+    private var listener_record: HTTPListenerRecord?
+    private var listener_generation: UInt64 = 0
+    private let listener_operation_lock = NSRecursiveLock()
     private let queue = DispatchQueue(label: "gemini.http", attributes: .concurrent)
+    private let callback_queue_key = DispatchSpecificKey<UInt8>()
     private let running_lock = NSLock()
     private var running_value = false
     var running: Bool {
@@ -15,18 +76,23 @@ final class HTTPServer {
         return running_value
     }
     var stateDidChange: ((Bool) -> Void)?
+    var state_did_fail: ((Error) -> Void)?
     let generator: TextGenerating
     let cfg: Store
 
     init(generator: TextGenerating, config: Store) {
         self.generator = generator
         self.cfg = config
+        queue.setSpecific(key: callback_queue_key, value: 1)
     }
 
     func start() throws {
-        stop()
+        listener_operation_lock.lock()
+        defer { listener_operation_lock.unlock() }
+        guard stop_active_listener(timeout: HTTP_SERVER_STOP_TIMEOUT_SECONDS) else {
+            throw HTTPServerLifecycleError.stop_timed_out
+        }
         let params = NWParameters.tcp
-        params.allowLocalEndpointReuse = true
         let port = NWEndpoint.Port(rawValue: UInt16(cfg.port))!
         let l: NWListener
         if cfg.host == "0.0.0.0" || cfg.host.isEmpty {
@@ -37,23 +103,83 @@ final class HTTPServer {
                 port: port)
             l = try NWListener(using: params)
         }
-        l.newConnectionHandler = { [weak self] conn in self?.accept(conn) }
-        l.stateUpdateHandler = { [weak self] state in
-            switch state {
-            case .ready: self?.updateRunning(true)
-            case .failed, .cancelled: self?.updateRunning(false)
-            default: break
-            }
+        listener_generation &+= 1
+        let generation = listener_generation
+        let cancellation = HTTPListenerCancellation()
+        l.newConnectionHandler = { [weak self] conn in
+            self?.accept(conn, generation: generation)
         }
-        updateRunning(false)
+        l.stateUpdateHandler = { [weak self] state in
+            if case .cancelled = state { cancellation.complete() }
+            self?.handle_listener_state(state, generation: generation)
+        }
+        listener_record = HTTPListenerRecord(
+            listener: l,
+            generation: generation,
+            cancellation: cancellation)
         l.start(queue: queue)
-        listener = l
     }
 
-    func stop() {
-        listener?.cancel()
-        listener = nil
+    // 功能：请求当前 listener 停止，并有界等待真实 cancelled 终态。
+    // 参数：timeout 为最长等待秒数。
+    // 返回值：完整停止时为 true；callback queue 内或超时时为 false。
+    @discardableResult
+    func stop(timeout: TimeInterval = HTTP_SERVER_STOP_TIMEOUT_SECONDS) -> Bool {
+        listener_operation_lock.lock()
+        defer { listener_operation_lock.unlock() }
+        return stop_active_listener(timeout: timeout)
+    }
+
+    // 功能：在串行 lifecycle 临界区停止当前代 listener。
+    // 参数：timeout 为最长等待秒数。
+    // 返回值：已观察 cancelled 时为 true，否则为 false。
+    private func stop_active_listener(timeout: TimeInterval) -> Bool {
+        guard let record = listener_record else { return true }
+        if !record.is_stopping {
+            record.is_stopping = true
+            record.listener.cancel()
+        }
+        if DispatchQueue.getSpecific(key: callback_queue_key) != nil {
+            updateRunning(false)
+            return false
+        }
+
+        let cancelled = record.cancellation.wait(timeout: timeout)
+        if cancelled, listener_record?.generation == record.generation {
+            listener_record = nil
+        }
         updateRunning(false)
+        return cancelled
+    }
+
+    // 功能：仅让当前 generation 的 state callback 更新状态或报告失败。
+    // 参数：state 为 Network 状态；generation 为 callback 所属代际 token。
+    // 返回值：无；旧代 callback 被忽略。
+    private func handle_listener_state(
+        _ state: NWListener.State,
+        generation: UInt64
+    ) {
+        listener_operation_lock.lock()
+        defer { listener_operation_lock.unlock() }
+        guard let record = listener_record,
+              record.generation == generation else { return }
+        switch state {
+        case .ready:
+            if !record.is_stopping { updateRunning(true) }
+        case .failed(let error):
+            guard !record.is_stopping else { return }
+            state_did_fail?(error)
+            if listener_record?.generation == generation {
+                record.is_stopping = true
+                record.listener.cancel()
+                updateRunning(false)
+            }
+        case .cancelled:
+            listener_record = nil
+            updateRunning(false)
+        default:
+            break
+        }
     }
 
     private func updateRunning(_ value: Bool) {
@@ -65,7 +191,15 @@ final class HTTPServer {
 
     // MARK: 连接读取
 
-    private func accept(_ conn: NWConnection) {
+    private func accept(_ conn: NWConnection, generation: UInt64) {
+        listener_operation_lock.lock()
+        let accepts_connection = listener_record?.generation == generation
+            && listener_record?.is_stopping == false
+        listener_operation_lock.unlock()
+        guard accepts_connection else {
+            conn.cancel()
+            return
+        }
         conn.start(queue: queue)
         let state = ConnState()
         readMore(conn, state)

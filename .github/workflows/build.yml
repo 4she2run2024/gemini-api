@@ -22,6 +22,9 @@ jobs:
       - name: Build
         run: ./build.sh
 
+      - name: Verify build artifacts
+        run: bash Tests/build-artifact-tests.sh --auto
+
       - name: Zip app
         run: ditto -c -k --keepParent "Gemini2API.app" Gemini2API-macOS.zip
 
@@ -36,3 +39,4 @@ jobs:
           path: |
             Gemini2API-macOS.zip
             Gemini2API.dmg
+            gemini2api-macOS

@@ -460,6 +460,7 @@ GitHub Actions 的 Test step 只调用统一 runner，随后构建并验证通�
 - 新增前台 `serve`、托管 daemon、稳定状态输出和安全 stop 生命周期。
 - 修复 App 同端口重启，并让 `status` 优先采用已核验 daemon 状态地址。
 - valued option 拒绝任意以连字符开头的 token，避免未知 option 被当作值。
+- 状态文本避免依赖新版 Swift 的可选布尔穷尽分析，兼容 CI 编译器。
 - 新增动态运行状态与日志路径、严格文件权限、脱敏日志和废纸篓轮转。
 - 构建与 CI 同步验证 App、CLI 的双架构、版本和 Release 附件清单。
 - 保持既有配置格式、七个 endpoint、SDK 用例和协议限制兼容。

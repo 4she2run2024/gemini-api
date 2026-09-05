@@ -11,6 +11,16 @@ private let CLI_STATUS_ENCODER: JSONEncoder = {
     return encoder
 }()
 
+// 功能：把可选健康状态转换为稳定中文文本。
+// 参数：healthy 为已确认健康、已确认异常或未知状态。
+// 返回值：分别返回“是”“否”或“未知”。
+func cli_health_text(_ healthy: Bool?) -> String {
+    if let healthy {
+        return healthy ? "是" : "否"
+    }
+    return "未知"
+}
+
 final class CLIApplication {
     private let store: Store
     private let generator_factory: () -> TextGenerating
@@ -224,15 +234,7 @@ final class CLIApplication {
     // 参数：report 为 controller 的稳定状态对象。
     // 返回值：多行中文状态文本。
     private func render_status(_ report: StatusReport) -> String {
-        let healthy: String
-        switch report.healthy {
-        case true:
-            healthy = "是"
-        case false:
-            healthy = "否"
-        case nil:
-            healthy = "未知"
-        }
+        let healthy = cli_health_text(report.healthy)
         var lines = [
             "状态：\(report.state.rawValue)",
             "托管：\(report.managed ? "是" : "否")",

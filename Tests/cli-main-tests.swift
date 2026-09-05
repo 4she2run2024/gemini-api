@@ -137,6 +137,9 @@ struct CLIMainTests {
         precondition(health_checker.calls.count == 1)
         precondition(health_checker.calls[0].0 == state.host)
         precondition(health_checker.calls[0].1 == state.port)
+        precondition(cli_health_text(true) == "是")
+        precondition(cli_health_text(false) == "否")
+        precondition(cli_health_text(nil) == "未知")
         print("CLIMainTests passed")
     }
 
